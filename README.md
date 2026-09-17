@@ -5,13 +5,17 @@ Also i do have custom controllers for my games
 
 Used [GalaginoPlus - VirtualClaudioBoy](https://github.com/VirtualClaudioBoy/GalaginoPlus)
 
-Games added here: Ghost n Goblins
+Games added here:
+
+Pinball Action
+
+Ghost n Goblins
 
 Sound is not 100% emulated
 
 Note: Ghosts'n Goblins is natively a horizontal/landscape game.
 
-This build is for landscape.
+These builds is for landscape.
 
 Rotation can be added.
 
