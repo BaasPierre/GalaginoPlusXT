@@ -8,8 +8,6 @@ static_assert(GNG_MEM_END <= RAMSIZE, "RAMSIZE too low for gng");
 
 static void ym_tables_init();
 
-#define GNG_MAME_FULL_W 256
-
 // GNG_SCREEN_X_ADJ and GNG_SPR_Y_ADJ: intended for cabinet-builder screen
 // positioning, currently UNWIRED (no call site). Both were previously
 // applied as a row-axis shift in blit_bg_strip()/blit_fg_tile(), which
@@ -19,13 +17,7 @@ static void ym_tables_init();
 // m_flip mirror (mame_x = m_flip ? 255-mame_x : mame_x, no shift). Do not
 // reintroduce a shift into either blit function without re-verifying
 // against hardware with Flip Screen ON specifically - see build notes.txt.
-#ifndef GNG_SCREEN_X_ADJ
-#define GNG_SCREEN_X_ADJ 16
-#endif
 
-#ifndef GNG_SPR_Y_ADJ
-#define GNG_SPR_Y_ADJ -16
-#endif
 
 void gng::reset() {
   machineBase::reset();
@@ -367,7 +359,7 @@ void IRAM_ATTR gng::scan_sprites(void) {
     mame_y = 240 - mame_y;
     spr.flip_y ^= 1;
 
-    spr.y = mame_x;   // fb row base (native mame_x)
+    spr.y = mame_x + GNG_SCREEN_X_ADJ;   // ← horizontal shift applied here(native mame)
     spr.x = mame_y - 16;              // fb col base (native mame_y, mirrored)
     // DSW1 Flip Screen ON (this cabinet's build, m_flip true at runtime -
     // see the GNG_SPR_FLIP_ON_Y_ADJ comment in gng.h): sprites otherwise
@@ -432,26 +424,21 @@ void IRAM_ATTR gng::blit_bg_strip(short row, char front) {
     if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
       continue;
     mame_x = m_flip ? (255 - mame_x) : mame_x;
+
+    // Horizontal shift (left/right on the physical screen)
+    mame_x += GNG_SCREEN_X_ADJ;
+    if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
+      continue;
+
     unsigned short *ptr = frame_buffer + r * 224;
 
     int world_x = (mame_x + m_bg_scrollx) & 0x1ff;
     int tcol    = (world_x >> 4) & 0x1f;
     int px0     = world_x & 0x0f;
 
-    // Run-length batching: the FINAL mame_y is a MONOTONIC function of
-    // scr_col (decreasing when !m_flip: 239-scr_col; increasing when
-    // m_flip: 16+scr_col - see the m_flip branch below for why it's
-    // 16+scr_col and NOT 31+scr_col). So consecutive scr_col values walk
-    // through world_y one step at a time in a single direction, meaning up
-    // to 16 consecutive screen columns land in the SAME 16x16 tile -
-    // recomputing idx/chr/attr/tile_id/colors for every one of the 224
-    // columns (as this used to) was redoing the same lookup up to 16x over.
-    // Do it once per run instead. This was the single biggest render-time
-    // cost (measured on real hardware: render time alone exceeded the
-    // entire per-half frame budget - see build notes.txt section 12).
     if (!m_flip) {
       for (int scr_col = 223; scr_col >= 0; ) {
-        int mame_y  = 239 - scr_col;               // == GNG_PANEL_MIRROR_COL(scr_col+16)
+        int mame_y  = 239 - scr_col;
         int world_y = (mame_y + m_bg_scrolly) & 0x1ff;
         int trow    = (world_y >> 4) & 0x1f;
         int py0     = world_y & 0x0f;
@@ -460,15 +447,10 @@ void IRAM_ATTR gng::blit_bg_strip(short row, char front) {
         unsigned char chr  = bg_chr[idx];
         unsigned char attr = bg_attr[idx];
 
-        // mame_y increases as scr_col decreases, so py0 increases as we walk
-        // scr_col downward - a run ends when py0 wraps past 15.
         int run = 16 - py0;
         if (run > scr_col + 1) run = scr_col + 1;
 
         bool grp1 = (attr & 0x08);
-        // MAME set_transmask: group0 (0xff,0x00) opaque pre-sprite / fully
-        // transparent post-sprite; group1 (0x41,0xbe) punch-through pens
-        // 0/6 only pre-sprite, everything BUT pens 0/6 post-sprite.
         if (front && !grp1) { scr_col -= run; continue; }
 
         unsigned int tile_id = (chr + ((attr & 0xc0) << 2)) & 0x3ff;
@@ -478,7 +460,7 @@ void IRAM_ATTR gng::blit_bg_strip(short row, char front) {
         int tile_x = flip_x ? (15 - px0) : px0;
 
         for (int k = 0; k < run; k++) {
-          int py = py0 + k;                         // world_y increases with k
+          int py = py0 + k;
           int tile_y = flip_y ? (15 - py) : py;
           unsigned char pen = gng_tiles[tile_id][tile_y][tile_x];
           bool punch = (pen == 0 || pen == 6);
@@ -488,25 +470,6 @@ void IRAM_ATTR gng::blit_bg_strip(short row, char front) {
         scr_col -= run;
       }
     } else {
-      // mame_y = 16+scr_col, NOT 31+scr_col: the panel mirror
-      // (GNG_PANEL_MIRROR_COL, base 255, a fixed physical-mounting
-      // constant - see the comment above) and the game's own m_flip
-      // mirror (base 240, MAME's flip_screen() convention) have DIFFERENT
-      // centers, so composing them as nested reflections leaves a residual
-      // 15px translation (255-240=15) - not the harmless "off-by-15" this
-      // file's own history mistakenly fixed by moving 16+scr_col to
-      // 31+scr_col. That change was wrong: it shifted the visible mame_y
-      // range from [16,239] to [31,254], permanently cutting the topmost
-      // ~15px of tilemap content (where this game's HUD text/score lives)
-      // and instead drawing 15px of normally-offscreen content at the
-      // bottom. Confirmed on hardware (2026-09-17): with Flip Screen ON,
-      // "TOP SCORE"/score text was missing from the top with stray content
-      // spilling into the bottom margin - exactly this range shift.
-      // 16+scr_col keeps mame_y in the correct [16,239] visible range for
-      // BOTH m_flip states, differing from !m_flip's 239-scr_col only in
-      // walk direction (increasing vs decreasing) - which IS what
-      // flip_screen is supposed to do (reverse which edge shows which
-      // content), not shift the range outside what was ever visible.
       for (int scr_col = 0; scr_col <= 223; ) {
         int mame_y  = 16 + scr_col;
         int world_y = (mame_y + m_bg_scrolly) & 0x1ff;
@@ -560,15 +523,17 @@ void IRAM_ATTR gng::blit_fg_tile(short row, char unused) {
     if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
       continue;
     mame_x = m_flip ? (255 - mame_x) : mame_x;
+
+    // Horizontal shift (left/right on the physical screen)
+    mame_x += GNG_SCREEN_X_ADJ;
+    if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
+      continue;
+
     unsigned short *ptr = frame_buffer + r * 224;
 
     int tcol = (mame_x >> 3) & 0x1f;
     int px0  = mame_x & 7;
 
-    // Run-length batching - see blit_bg_strip's comment for why this is
-    // safe (final mame_y is monotonic in scr_col) and necessary (was the
-    // dominant render-time cost). Up to 8 consecutive columns share one
-    // 8x8 fg tile.
     if (!m_flip) {
       for (int scr_col = 223; scr_col >= 0; ) {
         int mame_y = 239 - scr_col;
@@ -598,11 +563,6 @@ void IRAM_ATTR gng::blit_fg_tile(short row, char unused) {
         scr_col -= run;
       }
     } else {
-      // mame_y = 16+scr_col - see blit_bg_strip's comment for why 31+scr_col
-      // (this file's own earlier "off-by-15 fix") was actually wrong: it
-      // shifts the visible mame_y range from [16,239] to [31,254], cutting
-      // the HUD text (which lives at the very top of the FG tilemap) and
-      // drawing normally-offscreen content at the bottom instead.
       for (int scr_col = 0; scr_col <= 223; ) {
         int mame_y = 16 + scr_col;
         int trow = (mame_y >> 3) & 0x1f;

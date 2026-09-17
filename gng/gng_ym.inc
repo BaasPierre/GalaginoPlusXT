@@ -1,6 +1,37 @@
 #include <math.h>
 
-// ---------------------------------------------------------------------------
+#ifndef GNG_FM_VOL
+#define GNG_FM_VOL 3
+#endif
+
+// Per-channel gain (256 = 1.0)
+// Chip 0 channels 0-2 are usually music, chip 1 channels 3-5 are usually effects
+#ifndef GNG_FM_CH0_GAIN
+#define GNG_FM_CH0_GAIN 150   // music channel 0  (default ~75%)
+#endif
+#ifndef GNG_FM_CH1_GAIN
+#define GNG_FM_CH1_GAIN 150   // music channel 1
+#endif
+#ifndef GNG_FM_CH2_GAIN
+#define GNG_FM_CH2_GAIN 150   // music channel 2
+#endif
+#ifndef GNG_FM_CH3_GAIN
+#define GNG_FM_CH3_GAIN 256   // effects channel 3 (full)
+#endif
+#ifndef GNG_FM_CH4_GAIN
+#define GNG_FM_CH4_GAIN 256   // effects channel 4
+#endif
+#ifndef GNG_FM_CH5_GAIN
+#define GNG_FM_CH5_GAIN 256   // effects channel 5
+#endif
+// Example to use cCH gain:
+// GNG_FM_CH2_GAINMusic192 = 75%
+// GNG_FM_CH3_GAINEffects256 = 100%
+// 128 = 50%
+// ChannelTypical CH0 = Main melody/lead ; CH1 Harmony/second melody; CH2 Bass/accompaniment
+// CH3–CH5 Sound effects (sword, hits, etc.)
+// --------
+// -------------------------------------------------------------------
 // Real ymfm tables, transcribed verbatim (see file header). Built once into
 // integer form at gng::reset() time via ym_tables_init(); renderFmSample()'s
 // hot path is pure integer table lookups, 24000x/sec on the audio task.
@@ -273,10 +304,6 @@ void gng::ym_write(int chip, unsigned char reg, unsigned char val) {
 void gng::ym_frame(void) {
 }
 
-#ifndef GNG_FM_VOL
-#define GNG_FM_VOL 4
-#endif
-
 // --- clock one operator's envelope by one FM tick -------------------------
 // Ported from ymfm_fm.ipp fm_operator::clock_envelope(), exactly including
 // the OPN envelope clock divider: real hardware only advances env_counter's
@@ -396,10 +423,16 @@ int gng::renderFmSample() {
         }
         c.feedback[0] = c.feedback[1] = 0;
       } else if (pk == 0) {
-        for (int o = 0; o < 4; o++)
-          if (c.op[o].stage != 0)
-            c.op[o].stage = 4;    // release
-      }
+  for (int o = 0; o < 4; o++) {
+    if (c.op[o].stage != 0 && c.op[o].stage != 4) {
+      c.op[o].stage = 4;          // force release
+      // Optional safety: if envelope is still very high, jump it down a bit
+      // so the release doesn't start from a near-silent state and then explode
+      if (c.op[o].env > 0x300)
+        c.op[o].env = 0x300;
+    }
+  }
+}
     }
 
     fm_op_S &o1 = c.op[0];
@@ -457,13 +490,16 @@ int gng::renderFmSample() {
     if (al.out2) chan_out += opout2;
     if (al.out3) chan_out += opout3;
 
-    // clamp per-channel to the real chip's 14-bit signed range before
-    // summing channels together (ymfm_fm.ipp output_4op() clamps at each
-    // partial-sum step; clamping once per channel here is equivalent since
-    // all partial sums here are already-clamped operator outputs added at
-    // most 4 times).
+    // clamp per-channel ...
     if (chan_out > 8191) chan_out = 8191;
     if (chan_out < -8192) chan_out = -8192;
+
+    // Apply per-channel gain
+    static const int ch_gain[6] = {
+      GNG_FM_CH0_GAIN, GNG_FM_CH1_GAIN, GNG_FM_CH2_GAIN,
+      GNG_FM_CH3_GAIN, GNG_FM_CH4_GAIN, GNG_FM_CH5_GAIN
+    };
+    chan_out = (chan_out * ch_gain[ch]) >> 8;
 
     mix += chan_out;
   }
@@ -476,8 +512,9 @@ int gng::renderFmSample() {
   // Soft-knee limiter: pass anything under GNG_FM_KNEE through unchanged,
   // asymptotically compress anything above it toward GNG_FM_CEIL instead of
   // hard-clamping (which flat-tops -> an audible click on every overshoot).
-#define GNG_FM_KNEE 300
-#define GNG_FM_CEIL 450
+// Stronger soft-knee limiter (reduces hard clipping on SFX)
+    #define GNG_FM_KNEE 220       // was 300
+    #define GNG_FM_CEIL 380       // was 450
   {
     int m = mix, sign = 1;
     if (m < 0) { m = -m; sign = -1; }
@@ -488,6 +525,10 @@ int gng::renderFmSample() {
     }
     mix = sign * m;
   }
+// Final safety clamp – never let a single sample go beyond ±400
+  if (mix > 400)  mix = 400;
+  if (mix < -400) mix = -400;
+
   fm_last = mix;
   return mix;
 }

@@ -34,6 +34,8 @@
 #define GNG_AUDIO_IRQ_PER_FRAME 4
 #endif
 
+#define GNG_MAME_FULL_W 256
+
 #ifndef GNG_PANEL_FLIP_X
 #define GNG_PANEL_FLIP_X 0
 #endif
@@ -62,7 +64,11 @@
 // bug, not caused by it. Do not zero this out again just because the
 // BG/FG bug is fixed - they are separate corrections that both apply.
 #ifndef GNG_SPR_FLIP_ON_Y_ADJ
-#define GNG_SPR_FLIP_ON_Y_ADJ -16
+#define GNG_SPR_FLIP_ON_Y_ADJ 0 // floating air bug adjust to 0, 16 or -16 px depending on dip flip
+#endif
+
+#ifndef GNG_SCREEN_X_ADJ
+#define GNG_SCREEN_X_ADJ 16      // positive = shift content to the right on the physical screen
 #endif
 
 class gng : public machineBase
