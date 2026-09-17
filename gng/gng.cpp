@@ -1,23 +1,10 @@
 #include "gng.h"
 
 // Ghosts'n Goblins (Capcom, 1985). See source/mame/mame-master/src/mame/capcom/gng.cpp
-// v2026-09-16
-
+// v2026-09-17 14
 
 static_assert(GNG_MEM_END <= RAMSIZE, "RAMSIZE too low for gng");
-
 static void ym_tables_init();
-
-// GNG_SCREEN_X_ADJ and GNG_SPR_Y_ADJ: intended for cabinet-builder screen
-// positioning, currently UNWIRED (no call site). Both were previously
-// applied as a row-axis shift in blit_bg_strip()/blit_fg_tile(), which
-// broke the HUD (score/Top Score text cut off top, stray content in the
-// bottom margin) whenever DSW1 Flip Screen was ON - confirmed on hardware
-// this was a real regression against the pre-existing, working plain
-// m_flip mirror (mame_x = m_flip ? 255-mame_x : mame_x, no shift). Do not
-// reintroduce a shift into either blit function without re-verifying
-// against hardware with Flip Screen ON specifically - see build notes.txt.
-
 
 void gng::reset() {
   machineBase::reset();
@@ -249,12 +236,6 @@ void gng::publish_vram(void) {
   vram_front = back;
 }
 
-// TODO(sound): confirmed on hardware (2026-09-17) - audio crackles. Music
-// sounds correct; the crackling is specifically on game/sound-effect
-// channels, not the background music channel. Not yet investigated -
-// likely somewhere in ym_frame()/ym_write()/the FM channel mixing in
-// gng_ym.inc, or in the Z80 audio CPU IRQ pacing above (audio_irq_step),
-// rather than here in the M6809 main-CPU loop itself.
 void gng::run_frame(void) {
   const int audio_irq_step = GNG_SLICES / GNG_AUDIO_IRQ_PER_FRAME;
 
@@ -286,29 +267,6 @@ void gng::prepare_frame(void) {
   scan_sprites();
 }
 
-
-// MAME gng_state::draw_sprites (native ROT0 semantics):
-//   for offs = spriteram.bytes()-4 downto 0 step -4:
-//     attr = sr[offs+1]
-//     mame_x = sr[offs+3] - 0x100*(attr&1)
-//     mame_y = sr[offs+2]
-//     flipx  = attr & 0x04 ;  flipy = attr & 0x08
-//     code   = sr[offs+0] + ((attr<<2) & 0x300) ;  color = (attr>>4)&3
-//     gfx->transpen(bitmap, cliprect, code, color, flipx, flipy, mame_x, mame_y, 15)
-// (flip_screen() mirrors mame_x/mame_y about 240 and inverts both flips - not
-// used here, upright cabinet only).
-//
-// The panel is physically mounted sideways (landscape), so the frame buffer
-// is addressed directly in MAME's own native coordinate space - NO 90-degree
-// rotation and no axis swap between mame_x/mame_y and the frame_buffer's
-// row/col. frame_buffer is a 224-wide strip, stride 224, GNG_MAME_FULL_W
-// (256) rows tall over the full sweep:
-//   fb row (= "mame_x" sweep in blit_*)   = mame_x directly
-//   fb col (= "scr_col" sweep in blit_*)  = mame_y - 16 directly
-// flip_screen() (m_flip, DSW1 "Flip Screen", off by default) is a genuine
-// MAME cocktail-cabinet feature independent of panel mounting: when set, it
-// mirrors both axes and inverts both flip bits, exactly like MAME's own
-// flip_screen() implementation - it is NOT used to compensate for rotation.
 void IRAM_ATTR gng::scan_sprites(void) {
   active_sprites = 0;
   const unsigned char *sr = spriteram_shadow[m_render_spriteram];
@@ -337,38 +295,12 @@ void IRAM_ATTR gng::scan_sprites(void) {
       spr.flip_y ^= 1;
     }
 
-    // Physical-mounting mirror on the column axis, analogous to
-    // GNG_PANEL_MIRROR_COL in blit_bg_strip/blit_fg_tile (see the comment
-    // there) - keep both in sync if this ever needs to change. Mirroring an
-    // axis also inverts any flip flag ALONG that axis: without this, a
-    // multi-tile-tall composite's tiles land in the mirror-correct screen
-    // order (position swapped correctly) but each tile's own pixel content
-    // is read in the WRONG direction along the mirrored axis - i.e. each
-    // half is individually upside-down (its content flipped) even though
-    // the pair's relative top/bottom order looks right. flip_y is what
-    // blit_sprite applies against the column-axis walk (dx), so it's
-    // flip_y that must invert here, not flip_x (tied to the untouched row
-    // axis).
-    // Use MAME's OWN mirror constant (240, from flip_screen() just above -
-    // "sy = 240 - sy"), NOT 255: a sprite mirror has to reflect the tile's
-    // FAR edge (sy+15), not its near/top-left corner, onto the opposite
-    // side of the 224-wide visible strip (16..239) - 240-sy already bakes
-    // that in (255-sy would be off by exactly 15, the sprite's own
-    // height-minus-one, which showed up as the composite floating ~16px
-    // above where it should sit).
     mame_y = 240 - mame_y;
     spr.flip_y ^= 1;
 
     spr.y = mame_x + GNG_SCREEN_X_ADJ;   // ← horizontal shift applied here(native mame)
     spr.x = mame_y - 16;              // fb col base (native mame_y, mirrored)
-    // DSW1 Flip Screen ON (this cabinet's build, m_flip true at runtime -
-    // see the GNG_SPR_FLIP_ON_Y_ADJ comment in gng.h): sprites otherwise
-    // sit GNG_SPR_FLIP_ON_Y_ADJ px too low relative to the ground.
-    // Increasing spr.x moves a sprite UP the physical screen (confirmed by
-    // the 240-vs-255 mirror-constant fix above: switching to the smaller
-    // constant, which DECREASES spr.x, was what fixed "floating too high"
-    // into "correctly on the ground" - so the opposite correction here,
-    // increasing spr.x, moves sprites back up).
+
     if (m_flip)
       spr.x += GNG_SPR_FLIP_ON_Y_ADJ;
 
@@ -379,38 +311,6 @@ void IRAM_ATTR gng::scan_sprites(void) {
   }
 }
 
-// MAME get_bg_tile_info: 16x16 tiles, 32x32 map, TILEMAP_SCAN_COLS (tile_index
-// = col*32 + row, col = mame_x/16, row = mame_y/16). scrollx/scrolly apply in
-// native MAME axes. Two-pass priority split on attr bit 3 (tileinfo.group).
-// screen_update draws LAYER1 (uses bgmask) BEFORE sprites, then LAYER0 (uses
-// fgmask) AFTER sprites - tilemap_t::set_transmask(group,fgmask,bgmask) maps
-// fgmask->LAYER0, bgmask->LAYER1 (the naming is the reverse of what it looks
-// like). group0 = set_transmask(0,0xff,0x00): bgmask 0x00 -> fully opaque
-// pre-sprite; fgmask 0xff -> fully transparent post-sprite (group0 sits
-// UNDER sprites, drawn once). group1 = set_transmask(1,0x41,0xbe): bgmask
-// 0xbe -> only pens 0/6 visible pre-sprite; fgmask 0x41 -> everything BUT
-// pens 0/6 visible post-sprite (group1 sits OVER sprites, split across both
-// passes so pens 0/6 peek through from underneath).
-//
-// gng_tiles[code][y][x] is NATIVE MAME orientation (no rotation baked in).
-// For a given MAME-native pixel offset (px, py) inside the tile, with MAME's
-// own flipx/flipy (attr bits 4/5 via TILE_FLIPYX), the pixel is simply
-// gng_tiles[code][ flipy ? 15-py : py ][ flipx ? 15-px : px ].
-//
-// The panel is mounted sideways (landscape), so frame_buffer is addressed
-// directly in MAME's native axes - no 90-degree placement:
-//   fb_line (row in frame_buffer) = mame_x directly
-//   scr_col (col in frame_buffer) = mame_y - 16, MIRRORED (GNG_PANEL_MIRROR_COL)
-// The mirror is a physical-mounting compensation (this panel's horizontal
-// wiring/orientation is reversed relative to MAME's native left-to-right),
-// NOT the DIP-switch flip_screen() feature - confirmed on hardware: with
-// GNG_PANEL_MIRROR_COL applied the picture is landscape-correct and
-// left-right-mirror-free; without it the picture is landscape-correct but
-// mirrored left-right (player moves the wrong way, text backwards).
-// flip_screen (m_flip) still mirrors both axes about their native centers,
-// same as MAME's own flip_screen() - it is unrelated to panel mounting.
-// mame_y's visible range is 16..239 (224 rows); mirror about that range's
-// own center so the result stays in 16..239: mirror(y) = 16 + 239 - y = 255-y.
 #define GNG_PANEL_MIRROR_COL(mame_y) (255 - (mame_y))
 void IRAM_ATTR gng::blit_bg_strip(short row, char front) {
   int line0 = row * 8;
@@ -506,10 +406,6 @@ void IRAM_ATTR gng::blit_bg_strip(short row, char front) {
   }
 }
 
-// MAME get_fg_tile_info: 8x8 tiles, 32x32 map, TILEMAP_SCAN_ROWS (tile_index
-// = row*32 + col, row = mame_y/8, col = mame_x/8), pen 3 transparent.
-// gng_chars[code][y][x] is NATIVE MAME orientation - same flip/index rule as
-// blit_bg_strip: gng_chars[code][ flipy ? 7-py : py ][ flipx ? 7-px : px ].
 void IRAM_ATTR gng::blit_fg_tile(short row, char unused) {
   (void)unused;
   int line0 = row * 8;
@@ -594,13 +490,6 @@ void IRAM_ATTR gng::blit_fg_tile(short row, char unused) {
   }
 }
 
-// Native gng_sprites[code][y][x] (MAME orientation, no rotation baked in).
-// s->y is the fb-row base (== mame_x), s->x is the fb-col base (== mame_y -
-// 16), addressed directly with no mirror - the panel is mounted sideways.
-//
-// dy walks the fb-row axis, which is MAME's native x axis -> read the tile's
-// x index with flip_x. dx walks the fb-col axis, which is MAME's native y
-// axis -> read the tile's y index with flip_y.
 void IRAM_ATTR gng::blit_sprite(short row, unsigned char s_idx) {
   const struct sprite_S *s = &sprite[s_idx];
   const int y_strip = row * 8;
@@ -639,19 +528,6 @@ void IRAM_ATTR gng::render_row(short row) {
     return;
 
   if (row == 0) {
-    // Latch once for the whole 32-row sweep so a mid-sweep publish_vram()/
-    // publish_palette()/spriteram buffered-write on the other core cannot
-    // tear a multi-tile composite across two different snapshots (see
-    // gng.h for the full rationale). This used to re-latch spriteram AGAIN
-    // at row 18 ("sprites update faster than the background") - that was
-    // wrong: it's the exact same tearing bug applied to sprites, and worse,
-    // since sprites move every frame. A tall multi-tile sprite (or several
-    // sprites whose screen rows straddle the row-18 split) got its top half
-    // drawn from one spriteram snapshot and its bottom half from a LATER
-    // one - stale/mismatched tiles stitched into one object. This is the
-    // same "ghost sprite" class gyruss.cpp's preapre_sprites() comment
-    // documents fixing by moving to a single pass. Latch once, like the
-    // other two.
     m_render_vram = vram_front;
     m_render_palette = palette_front;
     m_render_spriteram = spriteram_front;
