@@ -31,16 +31,7 @@
 // ChannelTypical CH0 = Main melody/lead ; CH1 Harmony/second melody; CH2 Bass/accompaniment
 // CH3–CH5 Sound effects (sword, hits, etc.)
 // --------
-// -------------------------------------------------------------------
-// Real ymfm tables, transcribed verbatim (see file header). Built once into
-// integer form at gng::reset() time via ym_tables_init(); renderFmSample()'s
-// hot path is pure integer table lookups, 24000x/sec on the audio task.
-// ---------------------------------------------------------------------------
 
-// abs_sin_attenuation: sin(phase), phase 0..2*PI mapped to 10 bits (0..1023),
-// returned as a 4.8 fixed-point LOGARITHMIC attenuation (bigger = quieter).
-// Table covers one quarter-wave (256 entries); the rest is derived by
-// mirroring (ymfm_fm.ipp abs_sin_attenuation).
 static const uint16_t s_sin_table[256] = {
   0x859,0x6c3,0x607,0x58b,0x52e,0x4e4,0x4a6,0x471,0x443,0x41a,0x3f5,0x3d3,0x3b5,0x398,0x37e,0x365,
   0x34e,0x339,0x324,0x311,0x2ff,0x2ed,0x2dc,0x2cd,0x2bd,0x2af,0x2a0,0x293,0x286,0x279,0x26d,0x261,

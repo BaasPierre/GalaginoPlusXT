@@ -3,7 +3,9 @@
 // Ghosts'n Goblins (Capcom, 1985). See source/mame/mame-master/src/mame/capcom/gng.cpp
 // v2026-09-17 14
 
+
 static_assert(GNG_MEM_END <= RAMSIZE, "RAMSIZE too low for gng");
+
 static void ym_tables_init();
 
 void gng::reset() {
@@ -236,6 +238,12 @@ void gng::publish_vram(void) {
   vram_front = back;
 }
 
+// TODO(sound): confirmed on hardware (2026-09-17) - audio crackles. Music
+// sounds correct; the crackling is specifically on game/sound-effect
+// channels, not the background music channel. Not yet investigated -
+// likely somewhere in ym_frame()/ym_write()/the FM channel mixing in
+// gng_ym.inc, or in the Z80 audio CPU IRQ pacing above (audio_irq_step),
+// rather than here in the M6809 main-CPU loop itself.
 void gng::run_frame(void) {
   const int audio_irq_step = GNG_SLICES / GNG_AUDIO_IRQ_PER_FRAME;
 
