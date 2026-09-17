@@ -7,3 +7,9 @@ Used [GalaginoPlus - VirtualClaudioBoy](https://github.com/VirtualClaudioBoy/Gal
 
 Games added here: Ghost n Goblins
 There is an sound issue - not 100% emulated
+
+Note: Ghosts'n Goblins is natively a horizontal/landscape game.
+This build is for landscape.
+Rotation can be added.
+
+Enjoy!
