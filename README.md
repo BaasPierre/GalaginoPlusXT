@@ -21,4 +21,10 @@ Rotation can be added.
 
 Enjoy!
 
-Ps, regards to edits in audio.cpp file you need to diff out to see the changes, but for other edits like machines.h and src\machines\machineBase.h add its new instance MACHINE
+Ps, regards to edits in audio.cpp file you need to diff out to see the changes, but for other edits like machines.h (<#ifdef ENABLE_PBACTION
+
+#include "machines/pbaction/pbaction.h"
+
+#endif>
+
+and src\machines\machineBase.h add its new instance MCH_PBACTION or MCH_GNG
