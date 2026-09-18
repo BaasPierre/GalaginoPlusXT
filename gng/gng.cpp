@@ -2,7 +2,8 @@
 
 // Ghosts'n Goblins (Capcom, 1985). See source/mame/mame-master/src/mame/capcom/gng.cpp
 // v2026-09-17 14
-
+// Bug in mame: to continue hold extra_button then press start button
+// is replace by only pressing the start button 
 
 static_assert(GNG_MEM_END <= RAMSIZE, "RAMSIZE too low for gng");
 
@@ -110,7 +111,16 @@ unsigned char IRAM_ATTR gng::m6809_read(m6809_state *s, uint16_t addr) {
       if (k & BUTTON_LEFT)  r &= ~0x02;
       if (k & BUTTON_DOWN)  r &= ~0x04;
       if (k & BUTTON_UP)    r &= ~0x08;
-      if (k & BUTTON_FIRE)  r &= ~0x10;
+      // Real G&G hardware only accepts a "continue" on the post-game-over
+      // countdown via Fire HELD + Start pressed (confirmed against real
+      // MAME: coin alone or Start alone during "CONTINUE PLAY ?" never
+      // registers, Fire+Start does, immediately). That combo is otherwise
+      // a no-op everywhere else in the game (checked: a normal new-game
+      // Start behaves identically with Fire held or not), so synthesize it
+      // here - treat Fire as held whenever Start is pressed - to make
+      // continuing a one-button action instead of requiring the player to
+      // discover/hold the undocumented combo themselves.
+      if ((k & BUTTON_FIRE) || (k & BUTTON_START)) r &= ~0x10;
       if (k & BUTTON_EXTRA) r &= ~0x20;
       return r;
     }
@@ -306,13 +316,27 @@ void IRAM_ATTR gng::scan_sprites(void) {
     mame_y = 240 - mame_y;
     spr.flip_y ^= 1;
 
-    spr.y = mame_x + GNG_SCREEN_X_ADJ;   // ← horizontal shift applied here(native mame)
+    // Same "content originally at mame_x now appears at mame_x + ADJ" shift
+    // as blit_bg_strip()/blit_fg_tile() (see comments there), so sprites
+    // stay in registration with the tile layers.
+    spr.y = mame_x + GNG_SCREEN_X_ADJ;
     spr.x = mame_y - 16;              // fb col base (native mame_y, mirrored)
 
     if (m_flip)
       spr.x += GNG_SPR_FLIP_ON_Y_ADJ;
 
-    if (spr.y + 16 <= 0 || spr.y >= 288 || spr.x + 16 <= 0 || spr.x >= 224)
+    // Clip to the SAME window the tile layers use (render_row()'s
+    // [GNG_SCREEN_X_ADJ, GNG_SCREEN_X_ADJ + GNG_MAME_FULL_W)), not to the
+    // full 288-line physical panel. Real MAME clips sprites to the screen's
+    // visible cliprect same as the tilemap (gfx->transpen(..., cliprect,
+    // ...) - see the comment in the old backup file); the physical panel
+    // has 32 extra lines of pure blanking margin that real MAME never draws
+    // into, so a sprite must not be allowed to wander into it either, or it
+    // floats in what should be dead black space (visible now that
+    // GNG_SCREEN_X_ADJ can move that margin to a visible edge).
+    if (spr.y + 16 <= GNG_SCREEN_X_ADJ ||
+        spr.y >= GNG_SCREEN_X_ADJ + GNG_MAME_FULL_W ||
+        spr.x + 16 <= 0 || spr.x >= 224)
       continue;
 
     sprite[active_sprites++] = spr;
@@ -328,15 +352,17 @@ void IRAM_ATTR gng::blit_bg_strip(short row, char front) {
 
   for (int r = 0; r < 8; r++) {
     int fb_line = line0 + r;
-    int mame_x = fb_line;
+    // This physical output row (fb_line, fixed by ptr below) must show the
+    // source column that, unshifted, sits GNG_SCREEN_X_ADJ away - i.e. we
+    // pan the SOURCE opposite the requested shift, not resample a shifted
+    // source into a fixed destination (that old order never actually moved
+    // anything on screen: it just cropped one edge and left the other
+    // blank). Applied pre-mirror so it moves the picture on the physical
+    // screen regardless of flip_screen orientation.
+    int mame_x = fb_line - GNG_SCREEN_X_ADJ;
     if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
       continue;
     mame_x = m_flip ? (255 - mame_x) : mame_x;
-
-    // Horizontal shift (left/right on the physical screen)
-    mame_x += GNG_SCREEN_X_ADJ;
-    if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
-      continue;
 
     unsigned short *ptr = frame_buffer + r * 224;
 
@@ -423,15 +449,14 @@ void IRAM_ATTR gng::blit_fg_tile(short row, char unused) {
 
   for (int r = 0; r < 8; r++) {
     int fb_line = line0 + r;
-    int mame_x = fb_line;
+    // See the matching comment in blit_bg_strip() - shift the SOURCE
+    // opposite the requested screen shift, pre-mirror, so the fixed
+    // destination row (ptr below) actually displays moved content instead
+    // of a cropped resample of itself.
+    int mame_x = fb_line - GNG_SCREEN_X_ADJ;
     if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
       continue;
     mame_x = m_flip ? (255 - mame_x) : mame_x;
-
-    // Horizontal shift (left/right on the physical screen)
-    mame_x += GNG_SCREEN_X_ADJ;
-    if (mame_x < 0 || mame_x >= GNG_MAME_FULL_W)
-      continue;
 
     unsigned short *ptr = frame_buffer + r * 224;
 
@@ -514,7 +539,17 @@ void IRAM_ATTR gng::blit_sprite(short row, unsigned char s_idx) {
   int dy1 = (s->y + 16 > y_strip + 8) ? (y_strip + 8 - s->y) : 16;
 
   for (int dy = dy0; dy < dy1; dy++) {
-    int fb_line = (s->y + dy) - y_strip;
+    int abs_line = s->y + dy;
+    // scan_sprites() clips spr.y to the tile window with a 16px tolerance
+    // so a sprite straddling the window edge still passes there and gets
+    // its in-window rows drawn - but that tolerance means individual rows
+    // of the sprite CAN fall in the blanking margin (same margin
+    // render_row() skips for bg/fg), so clip each row here too or those
+    // rows draw into the margin uncropped (visible as enemies/shots
+    // floating in the black border).
+    if (abs_line < GNG_SCREEN_X_ADJ || abs_line >= GNG_SCREEN_X_ADJ + GNG_MAME_FULL_W)
+      continue;
+    int fb_line = abs_line - y_strip;
     int tile_x = s->flip_x ? (15 - dy) : dy;
     unsigned short *fb = &frame_buffer[fb_line * 224];
 
@@ -532,14 +567,42 @@ void IRAM_ATTR gng::blit_sprite(short row, unsigned char s_idx) {
 
 void IRAM_ATTR gng::render_row(short row) {
   int line0 = row * 8;
-  if (line0 >= GNG_MAME_FULL_W)
-    return;
-
+  // The physical panel receives 288 lines/frame (36 render_row() bands x 8 -
+  // see the render loop in main.cpp), but MAME's own picture is only
+  // GNG_MAME_FULL_W (256) lines. The spare 32 lines are blank margin that
+  // GNG_SCREEN_X_ADJ borrows from to shift the picture WITHOUT cropping real
+  // content: content sits at physical lines [GNG_SCREEN_X_ADJ,
+  // GNG_SCREEN_X_ADJ + GNG_MAME_FULL_W) instead of always [0, 256) - i.e.
+  // the margin moves to the opposite edge from the shift instead of being
+  // stuck entirely at the high end. Bands entirely outside that window are
+  // still blank (left at whatever main.cpp's memset put there) same as
+  // before. This is a coarse, whole-band early-out only (line0 is the
+  // band's FIRST line) - a band straddling the window edge (possible when
+  // GNG_SCREEN_X_ADJ isn't a multiple of 8) still needs to run so
+  // blit_bg_strip()/blit_fg_tile()'s own per-line mame_x clamp can draw its
+  // in-window lines.
+  // scan_sprites() must run once per frame regardless of the tile window
+  // below, so this latch-and-scan has to happen before that window can
+  // return early, or a positive GNG_SCREEN_X_ADJ would skip row 0 and
+  // sprites would never be scanned for the whole frame. scan_sprites()
+  // itself now clips spr.y to this same window, so active_sprites already
+  // excludes anything that would land in the blanking margin.
   if (row == 0) {
     m_render_vram = vram_front;
     m_render_palette = palette_front;
     m_render_spriteram = spriteram_front;
     scan_sprites();
+  }
+
+  if (line0 + 8 <= GNG_SCREEN_X_ADJ || line0 >= GNG_SCREEN_X_ADJ + GNG_MAME_FULL_W) {
+    // Outside the tile window: no surviving sprite can reach here either
+    // (scan_sprites() clipped spr.y to the same window, with a 16px
+    // tolerance for a sprite straddling the edge) - call blit_sprite()
+    // anyway since it's cheap and self-clips per band, so a straddling
+    // sprite's partial overlap into this band still gets drawn.
+    for (unsigned char s = 0; s < active_sprites; s++)
+      blit_sprite(row, s);
+    return;
   }
 
   blit_bg_strip(row, 0);
@@ -552,8 +615,12 @@ void IRAM_ATTR gng::render_row(short row) {
 #include "gng_ym.inc"
 
 const hiscore_region_S *gng::hiscoreRegions(unsigned char *count) {
-  *count = 0;
-  return 0;
+  static const hiscore_region_S regions[] = {
+    { 0x1518, 0x5a, 0x15, 0x72 },
+    { 0x00d0, 0x04, 0x00, 0x00 },
+  };
+  *count = sizeof(regions) / sizeof(regions[0]);
+  return regions;
 }
 
 #ifdef LED_PIN

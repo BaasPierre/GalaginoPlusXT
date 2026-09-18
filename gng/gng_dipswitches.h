@@ -143,7 +143,7 @@
 #define GNG_DSW2_LIVES_5                                     0x01
 //    7                            = 0x00
 #define GNG_DSW2_LIVES_7                                     0x00
-#define GNG_DSW2_LIVES_SELECTED                              GNG_DSW2_LIVES_7
+#define GNG_DSW2_LIVES_SELECTED                              GNG_DSW2_LIVES_3
 
 // DSW2 power-on byte (all switches at MAME default = 0xfb)
 #define GNG_DSW2_DEFAULT ( \

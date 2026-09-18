@@ -36,39 +36,24 @@
 
 #define GNG_MAME_FULL_W 256
 
-#ifndef GNG_PANEL_FLIP_X
-#define GNG_PANEL_FLIP_X 0
-#endif
-#ifndef GNG_PANEL_FLIP_Y
-#define GNG_PANEL_FLIP_Y 0
-#endif
-
 // Sprite column-axis (screen-vertical) correction when the game's own
-// DSW1 "Flip Screen" cabinet setting (gng_dipswitches.h,
-// GNG_DSW1_FLIP_SCREEN_SELECTED) is set to ON instead of MAME's default
-// OFF. This is a per-cabinet choice, not a bug: some physical builds need
-// DSW1 Flip Screen ON to match how their panel is mounted (independent of
-// GNG_PANEL_MIRROR_COL, which is a fixed physical-mounting mirror already
-// baked into scan_sprites()/blit_bg_strip()/blit_fg_tile() regardless of
-// this DIP).
-//
-// Measured on hardware at -16: with Flip Screen ON, sprites sit 16px too
-// LOW relative to the background. On 2026-09-17 a SEPARATE bug was found
-// and fixed in blit_bg_strip/blit_fg_tile's m_flip branch (mame_y was
-// 31+scr_col instead of the correct 16+scr_col - see gng.cpp's top-of-file
-// comment and build notes.txt), which also shifted the ground by 15px, so
-// it was briefly suspected that bug was the sole cause of this constant
-// and this was reset to 0 - that was WRONG. Reconfirmed on hardware
-// (2026-09-17, after the BG/FG fix) that -16 is still required: this is a
-// genuine, independent sprite-vs-background offset on top of the BG/FG
-// bug, not caused by it. Do not zero this out again just because the
-// BG/FG bug is fixed - they are separate corrections that both apply.
 #ifndef GNG_SPR_FLIP_ON_Y_ADJ
 #define GNG_SPR_FLIP_ON_Y_ADJ 0 // floating air bug adjust to 0, 16 or -16 px depending on dip flip
 #endif
 
+// Whole-screen shift on the row axis (mame_x - see blit_bg_strip()/
+// blit_fg_tile()/scan_sprites() in gng.cpp for the exact math). Content
+// that was at mame_x now appears at mame_x + GNG_SCREEN_X_ADJ, applied
+// identically to sprites and to bg/fg tiles so the layers stay in
+// registration. This is a genuine shift, not a re-crop of a fixed window:
+// a nonzero value necessarily crops GNG_SCREEN_X_ADJ px of real picture off
+// the edge the content moves away from (there is no wrap - the picture is
+// only 256px of native content, and the panel only ever showed 256px of
+// output, so shifting always trades a strip of image on one edge for a
+// strip of blank on the other). SIGN: not verified against a real cabinet -
+// if the picture moves the wrong physical direction, flip the sign.
 #ifndef GNG_SCREEN_X_ADJ
-#define GNG_SCREEN_X_ADJ 16      // positive = shift content to the right on the physical screen
+#define GNG_SCREEN_X_ADJ 16 // 0 moves example right
 #endif
 
 class gng : public machineBase
@@ -79,8 +64,6 @@ public:
 
   signed char machineType() override { return MCH_GNG; }
   signed char useVideoHalfRate() override { return 1; }
-  signed char videoFlipX() override { return GNG_PANEL_FLIP_X; }
-  signed char videoFlipY() override { return GNG_PANEL_FLIP_Y; }
 
   void reset() override;
   void stop() override;
