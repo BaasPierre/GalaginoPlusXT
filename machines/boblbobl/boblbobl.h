@@ -79,7 +79,7 @@ public:
   void run_frame(void) override;
   void prepare_frame(void) override;
   void render_row(short row) override;
-  const unsigned short *logo(void) override { return boblbobl_logo; }
+
   const char *hiscoreKey() override { return "boblbobl"; }
   const hiscore_region_S *hiscoreRegions(unsigned char *count) override;
   // High score RAM is the main CPU's (e000-f7ff): read/write through its map
@@ -92,6 +92,7 @@ public:
   // Bub (green) and Bob (blue)
   const CRGB menu_leds[7] = { LED_GREEN, LED_BLUE, LED_GREEN, LED_CYAN, LED_GREEN, LED_BLUE, LED_GREEN };
 #endif
+const unsigned short *logo(void) override;
 
 public:
   int renderFmSample() override;

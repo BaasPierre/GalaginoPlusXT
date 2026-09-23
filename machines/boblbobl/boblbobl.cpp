@@ -1529,6 +1529,10 @@ void boblbobl::menuLeds(CRGB *leds)
 }
 #endif
 
+const unsigned short *boblbobl::logo(void) {
+  return boblbobl_logo;
+}
+
 // ---- emulation-side chip register writes -----------------------------
 
 void IRAM_ATTR boblbobl::ym_write(unsigned char reg, unsigned char val)
