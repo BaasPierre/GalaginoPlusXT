@@ -5,24 +5,6 @@
 // truth (flstory_state/flstory_mcu_state, base_map/flstory_map, ROM_START
 // (flstory)). v2026-09-19
 
-// TEMPORARY (2026-09-19): on-device serial diagnostic for the "blue screen,
-// no serial output at all past machine-init" symptom seen after the
-// FLSTORY_SLICES/FLSTORY_MAIN_STEP pacing fix. Prints boot-sequence
-// checkpoints once via Serial (115200 baud, see platformio.ini) so we can
-// see how far real hardware gets without needing the (currently
-// AV-blocked) native harness. Defined HERE (not machines.h) so all of this
-// scaffolding - the define and every #ifdef FLSTORY_SERIAL_DEBUG block it
-// guards - lives in one file and is easy to strip out together once the
-// boot sequence is confirmed reaching the demo screen on real hardware.
-// DISABLED (2026-09-23): this costs real frame time on hardware. The
-// per-stage timers alone are 6 micros() calls per SLICE - 360 per frame at
-// FLSTORY_SLICES=60, ~21,600/second - measured at roughly 1-4% of the
-// 16,667us frame budget, on top of the Serial.printf traffic itself.
-// capture.txt showed run_frame averaging 17,760us against that budget, so
-// this is a real part of the overrun. Re-enable only while actively
-// debugging; every block it guards compiles away when it is off.
-//#define FLSTORY_SERIAL_DEBUG
-
 static_assert(FLSTORY_MEM_END <= RAMSIZE, "RAMSIZE too low for flstory");
 
 // MSM5232 envelope rate tables - defined further down (next to the rest of
@@ -45,8 +27,7 @@ void flstory_msm_build_rate_tables(uint32_t chip_clock);
 // unconditionally in the final binary regardless of whether ENABLE_FLSTORY
 // is defined, same as flstory.cpp itself is always compiled.
 //
-// BUG FIX (found 2026-09-19 debugging flstory's first boot - "yellow
-// screen" / MCU handshake never completing): these two functions used to
+// MCU handshake never completing): these two functions used to
 // be no-op stubs returning 0xFF unconditionally, on the theory that
 // m68705p5_mem_read()/write() "fully decode the MCU's entire address space
 // before falling through to this". That theory is WRONG for the actual
@@ -68,8 +49,7 @@ void flstory_msm_build_rate_tables(uint32_t chip_clock);
 // host_flag would go to 1 (the main CPU's write to 0xD000 still worked,
 // since that side genuinely does go through m68705p5_mem_write) but
 // mcu_flag never followed - the MCU never ran the code that would have
-// set it. Confirmed with a standalone harness (source/debug/
-// flstory_harness/check_mcu_step.cpp): PC read 0x07FF right after
+// set it. PC read 0x07FF right after
 // taito68705_reset(), then incremented one byte at a time from address
 // 0x0000 (a45-20.mcu's interrupt-vector-table region, not code)
 // on every subsequent instruction - the unmistakable signature of
@@ -129,8 +109,8 @@ void flstory::reset() {
   soundlatch_pending = false;
   soundlatch2 = 0;
   soundlatch2_pending = false;
-  // BUG FIX (found 2026-09-19 chasing the "BAD SOUND PCB" self-test
-  // failure): this used to start true ("held in reset"), on the theory
+  // "BAD SOUND PCB" self-test
+  // failure: this used to start true ("held in reset"), on the theory
   // that it works "same as gng's audio_running=false" - that precedent
   // doesn't actually apply here. gng's audio Z80 genuinely IS held off at
   // power-on by a real hardware latch bit (mainlatch bit1) that the main
@@ -145,11 +125,7 @@ void flstory::reset() {
   // the periodic audio IRQ) from power-on, so the audio Z80 never ran,
   // never answered the main CPU's early sound self-test handshake
   // (soundlatch write @0xD400 + poll for a soundlatch2 reply @0xD401 bit1
-  // - see the 50-retry loop at 0x0200-0x021A in the main ROM), and the
-  // test timed out into the "BAD SOUND PCB" message. Confirmed via the
-  // native harness (source/debug/flstory_harness): with this true,
-  // audio_pc stayed frozen at whatever address it happened to be at
-  // reset, for the entire run.
+
   audio_reset_held = false;
   soundnmi_bit1 = false;
 
@@ -201,24 +177,8 @@ void flstory::stop() {
 }
 
 void flstory::start() {
-  // FIX (2026-09-20, "game is very slow" investigation - see notes.txt):
-  // flstory never set game_started anywhere. Matches circusc.cpp's
-  // start()/game_started=1 pattern - set BEFORE emulation_start() creates
-  // emulation_task() (see src/emulation/emulation.cpp), so run_frame() is
-  // gated to real 60Hz video sync (ulTaskNotifyTake) from the very first
-  // frame. Without this, emulation_task() stayed permanently on the
-  // "boot speedup" vTaskDelay(1) branch - i.e. flstory ran run_frame()
-  // completely UNTHROTTLED for its entire runtime, not just during boot.
   game_started = 1;
 }
-
-// ============================================================================
-// Main CPU (Z80 #0) memory map - base_map + flstory_map, 0x0000-0xffff.
-// Dual-Z80 dispatch follows the same current_cpu==0/1 switch idiom as
-// 1942.cpp/pbaction.cpp/timeplt.cpp (all rdZ80/wrZ80/opZ80 are ONE shared
-// virtual pair across both CPUs - machineBase does not expose one per CPU
-// index).
-// ============================================================================
 
 unsigned char flstory::snd_flag_r(void) {
   // snd_flag_r(): (soundlatch pending? 0:1) | (soundlatch2 pending? 2:0).
@@ -240,7 +200,7 @@ unsigned char flstory::snd_flag_r(void) {
 void flstory::update_soundnmi(void) {
   bool new_line = soundlatch_pending || soundnmi_bit1;
   if (new_line && !soundnmi_line) {
-    // BUG FIX (2026-09-19): this function is called SYNCHRONOUSLY from the
+    // this function is called SYNCHRONOUSLY from the
     // MAIN CPU's own write handler (wrZ80 case 0xD400, the sound-latch-kick
     // write) as well as from the audio CPU's own read handler (rdZ80 case
     // 0xD800). Setting current_cpu=1 to correctly target the audio CPU's
@@ -250,12 +210,11 @@ void flstory::update_soundnmi(void) {
     // would silently go through rdZ80()'s AUDIO-CPU memory map instead of
     // the main CPU's, reading back garbage (audio ROM padding, 0xFFFF) as
     // a "return address" - confirmed via a full-register instruction trace
-    // (see debug/flstory_full_regs.tr / task_plain_4.txt) to be the actual
-    // root cause of the main CPU's boot sequence spuriously restarting
+    // the actual root cause of the main CPU's boot sequence spuriously restarting
     // from address 0 a second time, which is what made the MCU handshake
     // fail permanently (the MCU has moved on to idling by the second boot
     // pass, and its interrupt-driven command path legitimately does not
-    // reply to that specific command from idle - see task_plain_2.txt).
+    // reply to that specific command from idle).
     // Save/restore current_cpu around the injection so this function is
     // side-effect-free from its caller's point of view, regardless of
     // which CPU context it's called from.
@@ -267,7 +226,7 @@ void flstory::update_soundnmi(void) {
   soundnmi_line = new_line;
 }
 
-// flstory_mcu_status_r() (0xD805, main-CPU side): ground-truthed against
+// flstory_mcu_status_r() (0xD805, main-CPU side):
 // MAME's REAL driver source (source/mame/mame-master/src/mame/taito/
 // flstory.cpp, flstory_mcu_state::flstory_mcu_status_r()):
 //   bit0 = (host_semaphore_r()==CLEAR_LINE) ? 1 : 0   // "1 = MCU ready to receive"
@@ -383,8 +342,8 @@ unsigned char IRAM_ATTR flstory::rdZ80(unsigned short Addr) {
         // PORT_BIT(0x40/0x80, IP_ACTIVE_HIGH, IPT_UNKNOWN) source comment
         // "BAD IO if low" at face value - i.e. "must be high to pass".
         // That is backwards for what this ROM's own code actually checks:
-        // traced byte-for-byte in a standalone disassembly
-        // (source/debug/flstory_harness), the AND/JP NZ sequence takes the
+        // traced byte-for-byte in a standalone disassembly,
+        // the AND/JP NZ sequence takes the
         // FAILURE branch precisely when bits 6-7 are NONZERO - so the real
         // passing condition is both bits LOW (0), the opposite of the
         // comment's literal wording. (IP_ACTIVE_HIGH in MAME describes how
@@ -483,14 +442,6 @@ void IRAM_ATTR flstory::wrZ80(unsigned short Addr, unsigned char Value) {
       case 0xd400:
         soundlatch = Value;
         soundlatch_pending = true;
-#ifdef FLSTORY_SERIAL_DEBUG
-        // TEMPORARY: frame + real-cycle timing log for the "BAD SOUND PCB"
-        // investigation (task_plain_6.txt) - compare against the 0xD800
-        // write's frame/cycles below, and against real MAME's measured
-        // totalcycles=3,740,117 at the equivalent $0209 loop-init point.
-        Serial.printf("[flstory] frame=%lu cycles=%ld MAIN wrote 0xD400 (soundlatch) <- 0x%02X\n",
-                      dbg_frame_counter, dbg_main_cycle_counter, Value);
-#endif
         update_soundnmi(); // generic_latch's data_pending_callback -> soundnmi bit0 rising edge
         return;
       case 0xd403:
@@ -556,7 +507,6 @@ void IRAM_ATTR flstory::wrZ80(unsigned short Addr, unsigned char Value) {
       if (ay_addr < 14) {
         soundregs[ay_addr] = Value;
       } else if (ay_addr == 14) {
-        // BUG FIX (2026-09-23, "12-second trailing sound after the shot"):
         // register 14 is the AY's PORT A, wired on this board to
         // sound_control_2_w() - the TA7630 volume for the WHOLE AY chip
         // (MAME: port_a_write_callback() -> set_device_volume(m_ay,
@@ -595,14 +545,6 @@ void IRAM_ATTR flstory::wrZ80(unsigned short Addr, unsigned char Value) {
     if (Addr == 0xd800) {
       soundlatch2 = Value;
       soundlatch2_pending = true;
-#ifdef FLSTORY_SERIAL_DEBUG
-      // TEMPORARY: confirm whether the audio CPU ever actually reaches this
-      // reply-write during the sound self-test, and on which real frame
-      // (task_plain_6.txt - compare against the 0xD400 write's frame above
-      // and real MAME's measured 140-frame gap for this same handshake).
-      Serial.printf("[flstory] frame=%lu cycles=%ld AUDIO wrote 0xD800 (soundlatch2) <- 0x%02X, audio_pc=0x%04X\n",
-                    dbg_frame_counter, dbg_main_cycle_counter, Value, cpu[1].PC.W);
-#endif
       return;
     }
     if (Addr == 0xda00) {
@@ -646,11 +588,6 @@ unsigned char flstory::inZ80(unsigned short Port) { (void)Port; return 0xff; }
 // FLSTORY_SLICES the way the other machines' interrupt rates are.
 // ============================================================================
 void flstory::run_frame(void) {
-#ifdef FLSTORY_SERIAL_DEBUG
-  uint32_t flstory_dbg_frame_t0 = micros();
-  static uint32_t dbg_main_us = 0, dbg_audio_us = 0, dbg_mcu_us = 0;
-  static uint32_t dbg_stage_n = 0;
-#endif
   // Audio Z80 periodic IRQ: real hardware generates it from a discrete-logic
   // counter dividing the raw (undivided) 8MHz board clock by 0x10000, i.e.
   // 8000000/65536 ~= 122.07 Hz - NOT an integer multiple of the 60Hz video
@@ -675,7 +612,7 @@ void flstory::run_frame(void) {
   const int MAX_MCU_STEPS_PER_FRAME = 3500;
   int mcu_steps_this_frame = 0;
 
-  // MAIN CPU pacing (BUG FIX #2, 2026-09-19 - see flstory.h's
+  // MAIN CPU pacing: see flstory.h's
   // FLSTORY_MAIN_CYCLES_PER_FRAME comment and task_plain_6.txt): paced by
   // REAL Z80 cycles per frame now, not a fixed instruction count. Z80.c's
   // StepZ80()/Codes.h already maintain a real per-instruction T-state
@@ -686,9 +623,9 @@ void flstory::run_frame(void) {
   // are keyed to "per slice", keep their existing granularity) rather than
   // spent in one big burst per frame.
   //
-  // SPEED FIX (2026-09-20, "game speed" investigation part 2 - see
-  // FLSTORY_MAIN_CYCLES_PER_FRAME's own comment in flstory.h and
-  // PROGRESS.md): FLSTORY_MAIN_CYCLES_PER_FRAME itself is now scaled down
+  // SPEED FIX - see
+  // FLSTORY_MAIN_CYCLES_PER_FRAME's own comment in flstory.h
+  // : FLSTORY_MAIN_CYCLES_PER_FRAME itself is now scaled down
   // (FLSTORY_MAIN_CYCLE_SCALE_NUM/DEN) rather than capped by a separate
   // instruction count here - an earlier attempt at an instruction cap on
   // this loop was found to be the wrong lever (measured in the native
@@ -703,21 +640,11 @@ void flstory::run_frame(void) {
   static long main_cycle_debt = 0; // carries any per-slice rounding remainder forward
   const long main_cycles_per_slice = (long)FLSTORY_MAIN_CYCLES_PER_FRAME / FLSTORY_SLICES;
 
-  // MCU stepping: MCU clock (3.072MHz) vs main Z80 clock (~5.3667MHz) is
-  // not a clean small-integer ratio, so pace it with the same kind of
-  // fixed-point accumulator as the audio IRQ above - but now credited from
-  // the REAL main-CPU cycles just consumed (see above), not from a fixed
-  // FLSTORY_MAIN_STEP instruction count. This is strictly more accurate
-  // than the old scheme and requires no separate calibration: it's just
-  // "however many real main-CPU cycles actually elapsed this slice,
-  // translated 1:1 into the MCU's own clock domain".
   for (int i = 0; i < FLSTORY_SLICES; i++) {
     current_cpu = 0;
     long slice_cycle_budget = main_cycles_per_slice + main_cycle_debt;
     long main_cycles_this_slice = 0;
-#ifdef FLSTORY_SERIAL_DEBUG
-    uint32_t dbg_t_main0 = micros();
-#endif
+
     while (slice_cycle_budget > 0) {
       int icount_before = cpu[0].ICount;
       StepZ80(&cpu[0]);
@@ -725,63 +652,17 @@ void flstory::run_frame(void) {
       if (consumed <= 0) consumed = 1; // defensive: never spin forever on a 0/negative delta
       slice_cycle_budget -= consumed;
       main_cycles_this_slice += consumed;
-#ifdef FLSTORY_SERIAL_DEBUG
-      // TEMPORARY: real-cycle accounting (task_plain_6.txt) - mirrors the
-      // per-slice accounting above into a free-running total, for direct
-      // comparison against real MAME's own totalcycles measurements.
-      dbg_main_cycle_counter += consumed;
-      // One-shot watch for the sound self-test's retry-exhausted ("BAD
-      // SOUND PCB") failure path at ROM address $021A - logs the exact
-      // frame + real cycle count it's reached on (task_plain_6.txt: real
-      // MAME needs 12,803,644 cycles for the full 50-retry loop to
-      // succeed via the OLD instruction-count pacing; this fix should let
-      // the port comfortably exceed that before ever reaching $021A).
-      {
-        static bool s_seen_021a = false;
-        if (!s_seen_021a && cpu[0].PC.W == 0x021A) {
-          s_seen_021a = true;
-          Serial.printf("[flstory] frame=%lu cycles=%ld MAIN reached $021A (retry-exhausted / BAD SOUND path)\n",
-                        dbg_frame_counter, dbg_main_cycle_counter);
-        }
-      }
-#endif
-#if FLSTORY_DBG_HARNESS
-      // Per-instruction main-CPU PC trace hook, for diffing against a real
-      // MAME instruction trace (`trace file,0,noloop` in the MAME
-      // debugger) - see source/debug/flstory_harness. Optional so normal
-      // harness runs (which only sample once per frame) pay nothing extra;
-      // only set when the harness wants a fine-grained trace.
-      if (dbg_trace_hook) dbg_trace_hook(cpu[0].PC.W);
-      // Full-register trace hook (see flstory.h) - deliberately called
-      // AFTER StepZ80() so PC/SP/etc. reflect the state POST-instruction
-      // (i.e. this line's opcode byte is the one about to run NEXT, not
-      // the one that just ran - matches dbg_trace_hook's own convention of
-      // logging the PC about to be executed).
-      if (dbg_full_trace_hook) {
-        uint16_t sp_now = cpu[0].SP.W;
-        uint16_t top = (uint16_t)(rdZ80(sp_now) | (rdZ80((uint16_t)(sp_now + 1)) << 8));
-        dbg_full_trace_hook(cpu[0].PC.W, sp_now, cpu[0].AF.W, cpu[0].BC.W,
-                             cpu[0].DE.W, cpu[0].HL.W, rdZ80(cpu[0].PC.W), top);
-      }
-#endif
     }
     // Carry the (possibly negative) leftover into the next slice so the
     // per-frame total still averages out to FLSTORY_MAIN_CYCLES_PER_FRAME
     // exactly over time, instead of drifting from per-slice rounding.
     main_cycle_debt = slice_cycle_budget;
-#ifdef FLSTORY_SERIAL_DEBUG
-    dbg_main_us += micros() - dbg_t_main0;
-    uint32_t dbg_t_audio0 = micros();
-#endif
 
     if (!audio_reset_held) {
       current_cpu = 1;
       for (int s = 0; s < FLSTORY_AUDIO_STEP; s++)
         StepZ80(&cpu[1]);
     }
-#ifdef FLSTORY_SERIAL_DEBUG
-    dbg_audio_us += micros() - dbg_t_audio0;
-#endif
 
     // audio Z80 periodic IRQ pacing
     audio_irq_acc += (long)FLSTORY_AUDIO_IRQ_HZ;
@@ -793,29 +674,6 @@ void flstory::run_frame(void) {
       }
     }
 
-    // MCU pacing: credit the MCU clock with however many REAL main-CPU
-    // cycles were just consumed THIS SLICE (main_cycles_this_slice, from
-    // the real ICount-based accounting above), converted into the MCU's
-    // own clock domain by the same FLSTORY_MCU_CLOCK/FLSTORY_MAIN_CLOCK
-    // ratio as before - this is now genuinely cycle-accurate on the main-
-    // CPU side (previously it credited a FIXED FLSTORY_MAIN_STEP
-    // instruction count regardless of what those instructions actually
-    // cost, which is the same approximation BUG FIX #2 above replaces).
-    // BUG FIX (2026-09-20, "game is very slow" investigation - see
-    // notes.txt): taito68705_step(s, 1) executes ONE FULL MCU INSTRUCTION
-    // per call (verified by reading m6805_step()/step_one() directly -
-    // `count` is instructions, not cycles), typically costing 4-13+ real
-    // MCU cycles - but the credit used to be drained by a FIXED
-    // FLSTORY_MAIN_CLOCK "one tick" amount per CALL regardless of the
-    // instruction's real cost, the same class of bug already fixed for
-    // the main CPU above. Measured impact: MCU was executing ~50,000
-    // instructions/frame against a real budget of ~6,400-12,450/frame -
-    // a ~4-8x overrun, and the dominant cost in run_frame() (~70-75% of
-    // total). Fixed by reading taito68705_step()'s real returned cycle
-    // count and draining by that instead.
-#ifdef FLSTORY_SERIAL_DEBUG
-    uint32_t dbg_t_mcu0 = micros();
-#endif
     // 64-bit multiply: see flstory.h's m_mcu_cycle_credit comment - this
     // OVERFLOWS a 32-bit long once a single slice's main_cycles_this_slice
     // gets large enough (i.e. once FLSTORY_SLICES drops low enough that
@@ -827,36 +685,8 @@ void flstory::run_frame(void) {
       mcu_steps_this_frame++;
       if (mcu_cycles_consumed <= 0) mcu_cycles_consumed = 1; // defensive: never spin forever on a 0/negative return
       m_mcu_cycle_credit -= (long long)mcu_cycles_consumed * (long long)FLSTORY_MAIN_CLOCK;
-#if FLSTORY_DBG_HARNESS
-      // Per-instruction mcu_flag rising-edge counter (see flstory.h's
-      // dbg_mcu_flag_pulses()) - per-FRAME sampling of mcu_flag can miss a
-      // pulse entirely if the main CPU's own read (taito68705_data_r, which
-      // clears mcu_flag) happens later in the SAME frame, since run_frame()
-      // only reports state after the whole frame's stepping is done.
-      {
-        static bool s_last_mcu_flag = false;
-        bool now = taito68705_mcu_flag(&m_bmcu_state) != 0;
-        if (now && !s_last_mcu_flag) dbg_mcu_flag_pulse_count++;
-        s_last_mcu_flag = now;
-      }
-      if (dbg_mcu_trace_hook)
-        dbg_mcu_trace_hook((uint16_t)(m_bmcu_state.mcu.cpu.PC & m_bmcu_state.mcu.cpu.cfg->addr_mask),
-                            taito68705_host_flag(&m_bmcu_state), taito68705_mcu_flag(&m_bmcu_state));
-#endif
     }
-#ifdef FLSTORY_SERIAL_DEBUG
-    dbg_mcu_us += micros() - dbg_t_mcu0;
-#endif
   }
-#ifdef FLSTORY_SERIAL_DEBUG
-  if (++dbg_stage_n >= 60) {
-    Serial.printf("[flstory] stage us/frame: main=%lu audio=%lu mcu=%lu\n",
-                  (unsigned long)(dbg_main_us / dbg_stage_n),
-                  (unsigned long)(dbg_audio_us / dbg_stage_n),
-                  (unsigned long)(dbg_mcu_us / dbg_stage_n));
-    dbg_main_us = 0; dbg_audio_us = 0; dbg_mcu_us = 0; dbg_stage_n = 0;
-  }
-#endif
 
   // vblank IRQ on the main CPU, once per frame (irq0_line_hold in MAME).
   current_cpu = 0;
@@ -884,40 +714,6 @@ void flstory::run_frame(void) {
     memcpy(scrlram_shadow[back], &memory[FLSTORY_SCRLRAM], sizeof(scrlram_shadow[0]));
     scrlram_front = back;
   }
-
-#ifdef FLSTORY_SERIAL_DEBUG
-  // TEMPORARY on-device diagnostic (2026-09-19) - real hardware showed a
-  // plain blue screen after flashing the corrected FLSTORY_SLICES/
-  // FLSTORY_MAIN_STEP pacing; this prints once/sec via the serial monitor
-  // (115200 baud, see platformio.ini) so we can see exactly where the real
-  // main CPU/MCU sit without needing the (currently AV-blocked) native
-  // harness. REMOVE once the boot sequence is confirmed reaching the demo
-  // screen on real hardware - this is not meant to ship.
-  {
-    dbg_frame_counter++;
-    if ((dbg_frame_counter % 60) == 0) {
-      unsigned char host_flag = taito68705_host_flag(&m_bmcu_state);
-      unsigned char mcu_flag  = taito68705_mcu_flag(&m_bmcu_state);
-      uint16_t mcu_pc = (uint16_t)(m_bmcu_state.mcu.cpu.PC & m_bmcu_state.mcu.cpu.cfg->addr_mask);
-      Serial.printf("[flstory] frame=%lu main_pc=0x%04X audio_pc=0x%04X audio_held=%d mcu_pc=0x%04X host_flag=%d mcu_flag=%d gfxctrl=0x%02X\n",
-                    dbg_frame_counter, cpu[0].PC.W, cpu[1].PC.W, audio_reset_held ? 1 : 0,
-                    mcu_pc, host_flag, mcu_flag, m_gfxctrl);
-    }
-  }
-
-  {
-    uint32_t dt = micros() - flstory_dbg_frame_t0;
-    static uint32_t max_dt = 0, sum_dt = 0, n = 0;
-    sum_dt += dt;
-    n++;
-    if (dt > max_dt) max_dt = dt;
-    if (n >= 60) {
-      Serial.printf("[flstory] run_frame: avg %lu us  max %lu us  (target <16667)\n",
-                    (unsigned long)(sum_dt / n), (unsigned long)max_dt);
-      sum_dt = 0; n = 0; max_dt = 0;
-    }
-  }
-#endif
 }
 
 void flstory::prepare_frame(void) {
@@ -938,87 +734,7 @@ void flstory::publish_vram(void) {
 
 // ============================================================================
 // Video rendering.
-//
-// Hardware/orientation note: the physical panel this project targets is a
-// fixed PORTRAIT 224-column framebuffer walked in 8-line bands (see
-// main.cpp: frame_buffer is 224 wide, 36 bands/frame = 288 lines/frame).
-// flstory's native MAME picture is 256w x 224h landscape (FLSTORY_MAME_
-// FULL_W/H, screen.set_raw's cliprect) and MAME rotates it 180 degrees for
-// display (GAME(...,ROT180,...) - see the GAME() line in flstory.cpp).
-//
-// This codebase's other landscape-shaped-native games handle the portrait-
-// panel mismatch differently from how this port approaches it, and none of
-// this project's other ROT90/ROT270 games (bombjack, 1942, timeplt, mrdo,
-// pbaction, frogger - all portrait-native, so they map fairly directly)
-// needed a landscape case at all. Ghosts'n Goblins (ROT0, also landscape)
-// is the closest available precedent for "landscape picture on a portrait
-// panel" and confirms the necessary axis relabel (native X -> panel row,
-// native Y -> panel column) - but gng.cpp's OWN specific implementation of
-// that relabel (its adjustable GNG_SCREEN_X_ADJ shift-constant scheme) is
-// not treated as an endorsed pattern here (it is slated for removal from
-// gng.cpp in a later cleanup) and is deliberately NOT reproduced: the
-// mapping below uses a single fixed FLSTORY_ROW_OFFSET constant (see
-// flstory.h) instead of any adjustable/shiftable knob, following the more
-// direct, concrete-formula style this codebase's portrait-native machines
-// use (e.g. timeplt.cpp's extract_sprites(): "spr.x = (int)sy_raw - 17",
-// derived once from the geometry and written as one plain formula, not
-// through an intermediate abstraction layer).
-//
-// The concrete mapping used throughout this file (VERIFIED on real
-// hardware, 2026-09-19 - see the two fixes below):
-//   panel_row = FLSTORY_ROW_OFFSET + (FLSTORY_MAME_FULL_W - 1 - mame_x)
-//   panel_col = mame_y - FLSTORY_CLIP_TOP
-// Only the row axis (native X) is point-reflected; the column axis (native
-// Y) maps straight through (after subtracting the cliprect's own base
-// offset - see FLSTORY_CLIP_TOP in flstory.h and TO DO #2 in PROGRESS.md).
-// This was originally written with BOTH axes reflected (as a single
-// "ROT180 = point-reflect through the center" guess - see the superseded
-// reasoning this replaces), which produced an upside-down, left-right-
-// mirrored picture on real hardware. Two independent, separately-diagnosed
-// fixes corrected it:
-//   1. Upside-down orientation: fixed via the SWA "Flip Screen" DIP
-//      default (flstory_dipswitches.h's FLSTORY_SWA_FLIP_SCREEN_SELECTED),
-//      NOT by touching this mapping - flstory_gfxctrl_w()'s own m_flip
-//      mirror (driven by the game reading that DIP and writing gfxctrl) is
-//      the correct, MAME-faithful mechanism for this, exactly like a real
-//      cabinet's flip-screen DIP. IMPORTANT: this DIP default is ON, and
-//      the user's actual cabinet/panel needs it ON to get correct base
-//      orientation (landscape-picture-on-portrait-panel, left-to-right) -
-//      m_flip/flip_screen is therefore the PERMANENTLY ACTIVE steady-state
-//      path on this hardware, not an occasionally-toggled edge case, so its
-//      own internal transform must be exactly right, not just "close".
-//   2. Left-right mirroring (still present after fix 1): fixed HERE, by
-//      removing the column axis's point-reflection - panel_col = mame_y
-//      directly instead of FULL_H-1-mame_y. Every place that derives a
-//      column/x-coordinate from mame_y (blit_bg_strip()'s mame_y computed
-//      from scr_col, scan_sprites()'s spr.x from mame_y) was updated the
-//      same way. The row axis's reflection (native X -> panel row) was
-//      NOT touched by this fix and remains correct as originally written.
-//
-// flip_screen()'s OWN transform (m_flip / FLSTORY_SWA_FLIP_SCREEN, distinct
-// from the fixed row-axis reflection above, which is this port's own
-// portrait-panel adaptation and always active regardless of the DIP) is
-// modeled two different ways in real MAME depending on layer, both
-// re-derived from source rather than approximated as a blanket pixel
-// mirror (2026-09-20, "FG rotation" investigation - see PROGRESS.md TO DO
-// #2/#3 and the two functions' own header comments for the exact formulas):
-//   - Background tilemap (blit_bg_strip()): flip_screen_set() drives
-//     tilemap_manager::set_flip_all(), a TILE-GRANULARITY logical<->memory
-//     remap (tilemap.cpp's mappings_update()) plus an XOR of each tile's
-//     OWN attribute flip bits with the global flip (realize_tile()) - NOT a
-//     per-pixel mirror. Sub-tile pixel offsets are never themselves
-//     reflected.
-//   - Sprites (blit_sprite()/scan_sprites()): flstory_draw_sprites() in
-//     real MAME applies flip_screen() manually and completely by itself
-//     (sx=(240-sx)&0xff, sy=sy-1, flipx/flipy inverted) - this is already a
-//     full, self-contained bitmap-space coordinate, needing no further
-//     mirroring on top.
-// ============================================================================
 
-// Tile decode source: flstory_tilemap[4096][8][8] is fully pen-decoded
-// (regenerated using flstory's REAL charlayout - see the header comment in
-// flstory_tilemap.h itself for the exact bit-level formula and the evidence
-// that the file this project shipped with before this port used the WRONG,
 // generic gfx_8x8x4_planar layout instead). tile_number = code +
 // ((attr&0xc0)<<2) + 0x400 + 0x800*char_bank, per get_tile_info().
 static inline unsigned int flstory_tile_number(unsigned char code, unsigned char attr, unsigned char char_bank) {
@@ -1030,15 +746,6 @@ void IRAM_ATTR flstory::scan_sprites(void) {
   const unsigned char *sr = spriteram_shadow[m_render_spriteram];
   bool flip = m_render_flip;
 
-  // flstory_draw_sprites(): the LAST 32 bytes of the 0xa0 spriteram block
-  // are a priority-order table (pr = spriteram[bytes-1-i] for i=0x1f..0),
-  // each entry's low 5 bits (pr&0x1f) indexing a sprite in the FIRST 0x80
-  // bytes (32 sprites * 4 bytes). Iterated i=0x1f downto 0 in MAME so the
-  // LAST-processed entry (i=0) ends up drawn on TOP in painter's-algorithm
-  // order - same iteration order reproduced here (loop counts down, and
-  // active_sprites[] is later walked forward by render_row()/blit_sprite(),
-  // so index 0 in our array = i=0x1f = drawn FIRST = bottom of the stack,
-  // matching MAME's own draw order exactly).
   for (int i = 0x1f; i >= 0 && active_sprites < 32; i--) {
     unsigned char pr = sr[0xa0 - 1 - i];
     unsigned int offs = (unsigned int)(pr & 0x1f) * 4;
@@ -1059,32 +766,6 @@ void IRAM_ATTR flstory::scan_sprites(void) {
       sy = 240 - sy - 1;
     }
 
-    // sx/sy here are still native MAME coordinates (sx up to 0xff, sy
-    // already un-mirrored above), matching real MAME's own
-    // gfx(1)->prio_transpen(bitmap, cliprect, code, color, flipx, flipy,
-    // sx, sy, ...) call EXACTLY - i.e. (sx,sy) is the sprite's TOP-LEFT
-    // corner in native bitmap space (drawgfx.cpp's destx/desty), the same
-    // convention as any other MAME gfx_element draw call - NOT the
-    // sprite's "bottom edge", a prior version of this comment's mistaken
-    // claim (see the BUG FIX below). sy wraps per the "wrap around" case in
-    // flstory_draw_sprites() for sx>240 (drawn a second time at sx-256).
-    //
-    // Convert to panel row/col using the fixed formula from this section's
-    // header comment: panel_row = FLSTORY_ROW_OFFSET + (FULL_W-1-mame_x),
-    // panel_col = mame_y - FLSTORY_CLIP_TOP (NOT reflected - see
-    // blit_bg_strip()'s matching comment).
-    //
-    // BUG FIX (2026-09-20, "FG rotation/2-piece sprite" investigation - see
-    // PROGRESS.md TO DO #3): panel_row's formula point-reflects mame_x
-    // (FULL_W-1-mame_x), so as the panel row increases across the sprite's
-    // own 16px height, the corresponding mame_x DECREASES - i.e. the panel-
-    // space anchor (spr.y, this sprite's minimum panel row) must correspond
-    // to the sprite's MAXIMUM mame_x edge (sx+15), not its minimum (sx) as
-    // this used to compute (spr.y = ROW_OFFSET+(FULL_W-1-mame_x) with
-    // mame_x=sx put the anchor at the WRONG edge, making blit_sprite()
-    // walk mame_x backwards from sx-15 to sx instead of forwards from sx to
-    // sx+15 - the direct cause of blit_sprite()'s own matching tile_x fix,
-    // see that function's header comment).
     int wrap_count = (sx > 240) ? 2 : 1;
     for (int wrap = 0; wrap < wrap_count && active_sprites < 32; wrap++) {
       int mame_x = sx - (wrap ? 256 : 0);
@@ -1112,104 +793,17 @@ void IRAM_ATTR flstory::scan_sprites(void) {
   }
 }
 
-// blit_bg_strip() - draws one 8-line band of the SINGLE 32x32 background
-// tilemap, filtered by tile category (bit5 of the attribute byte,
-// tileinfo.category in get_tile_info()) and by front/back transmask pass,
-// reproducing screen_update_flstory()'s exact 4-call draw order:
-//   draw(cat0,LAYER1) draw(cat1,LAYER1) draw(cat0,LAYER0) draw(cat1,LAYER0) draw_sprites()
-// A tilemap's set_transmask(group,transmask_front,transmask_back) marks
-// which PENS are transparent on the "front" (LAYER1) vs "back" (LAYER0)
-// half of a draw call. Per flstory's VIDEO_START:
-//   set_transmask(0, 0x3fff, 0xc000) -> category 0: LAYER1 transmask=0x3fff
-//     (pens 0-13 transparent, pens 14-15 opaque) / LAYER0 transmask=0xc000
-//     (pens 14-15 transparent, pens 0-13 opaque)
-//   set_transmask(1, 0x8000, 0x7fff) -> category 1: LAYER1 transmask=0x8000
-//     (pen 15 transparent, pens 0-14 opaque) / LAYER0 transmask=0x7fff
-//     (pens 0-14 transparent, pen 15 opaque)
-// i.e. for a given (category, layer) pass, pen p is drawn (opaque) iff
-// bit p of that pass's transmask is 0. This is reproduced below as a
-// direct 16-bit mask test per pixel instead of gng's simpler two-pen-value
-// "punch" test (gng's hardware only ever punches 2 fixed pens per pass;
-// flstory's transmask scheme is fully general so it's tested generally).
 static inline bool flstory_pen_opaque(unsigned short transmask, unsigned char pen) {
   return ((transmask >> pen) & 1) == 0;
 }
 
 void IRAM_ATTR flstory::blit_bg_strip(short row) {
-  // BUG FIX (2026-09-20, "game is very slow" investigation - see
-  // notes.txt): this used to be called 4 TIMES per row from render_row()
-  // (category 0/1 x front/back), each call independently re-walking all
-  // 8x224 pixels of the strip and redoing the FULL per-pixel VRAM read +
-  // tile-id computation + palette lookup + flip logic + flstory_tilemap[]
-  // read BEFORE checking whether that pixel's tile_category even matched
-  // the pass's own category (an early `continue` otherwise) - i.e. 3 of
-  // every 4 calls did full lookup work on roughly half their pixels only
-  // to discard the result. Measured cost: ~62.8ms/frame (bg= in the
-  // render us/frame printout), by far the largest single render cost -
-  // collapsed to a substantially cheaper single per-pixel lookup
-  // (measured ~23-26ms/frame after this fix, ~2.4-2.7x reduction).
-  //
-  // COMPOSITING ORDER: verified against real MAME's actual draw order
-  // (source/mame/mame-master/src/mame/taito/flstory.cpp, draw_background():
-  // `m_bg_tilemap->draw(..., 0|TILEMAP_DRAW_LAYER1, ...)` then
-  // `1|TILEMAP_DRAW_LAYER1` then `0|TILEMAP_DRAW_LAYER0` then
-  // `1|TILEMAP_DRAW_LAYER0` - i.e. LAYER1 (front, both categories) draws
-  // completely BEFORE LAYER0 (back, both categories). For a FIXED pixel
-  // (one category), the original 4-pass code's per-category pass ORDER
-  // was: pass1/2 (front, category's own front transmask) runs, THEN
-  // pass3/4 (back, category's own back transmask) runs LATER and
-  // OVERWRITES pass1/2's result if back's own transmask says opaque too -
-  // i.e. BACK effectively wins over FRONT for a matching pixel, since it
-  // draws second. This is reproduced exactly below: front's opacity test
-  // is applied first, then back's is applied and allowed to overwrite -
-  // NOT "front wins, else back" (which would invert the real priority -
-  // checked and rejected twice this session, since getting this backwards
-  // would be a real new visual bug, not just a performance change).
   int line0 = row * 8;
   const unsigned char *vram = flstory_vram_shadow[m_render_vram];
   const unsigned char *scrl = scrlram_shadow[m_render_scrlram];
   bool flip = m_render_flip;
 
-  // BUG FIX (2026-09-20, "screen Y axis too large / FG rotation" investigation
-  // - see PROGRESS.md TO DO #2). Two separate, previously-conflated bugs in
-  // this function's flip handling, re-derived from real MAME's ACTUAL flip
-  // mechanism (source/mame/mame-master/src/emu/tilemap.cpp) instead of the
-  // "point-reflect the pixel coordinate" approximation this used to use:
-  //
-  //  MAME's flip_screen_set() -> tilemap_manager::set_flip_all() ->
-  //  tilemap_t::mappings_update(): flip is a TILE-GRANULARITY remap of
-  //  logical (col,row) <-> memory (col,row) - `logical_col = 31-logical_col`,
-  //  `logical_row = 31-logical_row` when flipped - baked in ONCE per flip-
-  //  state change, not a per-pixel mirror applied at draw time. The actual
-  //  per-pixel draw (tilemap_t::draw_instance(), pixmap()) reads the
-  //  logical/screen position DIRECTLY, unmirrored - all the mirroring
-  //  already happened when the memory index was picked. On top of that,
-  //  tilemap_t::realize_tile() XORs the tile's OWN per-tile flip bits with
-  //  the global flip attributes: `flags = tileinfo.flags ^ attributes`
-  //  (tilemap.cpp:806) - i.e. flip_screen doesn't just relocate which tile
-  //  is shown at a position, it ALSO flips that tile's own pixels a second
-  //  time on top of its own attribute-driven flip.
-  //
-  //  The previous code instead mirrored mame_x/mame_y (pixel coordinates)
-  //  directly before deriving tcol/trow/px0/py0 from them - this reflects
-  //  the SUB-TILE pixel offset (px0/py0) around the tilemap's pixel center
-  //  in addition to the tile index, which is not what real MAME does (the
-  //  sub-tile offset within a tile is never itself reflected - only the
-  //  tile's OWN attribute flip bits, now XORed with the global flip,
-  //  decide whether that offset is read forwards or backwards). For most
-  //  8x8 content this happened to look approximately plausible, but it is
-  //  not the real transform and is the likely source of the reported FG
-  //  rotation/orientation glitches (this DIP defaults flip ON for this
-  //  cabinet - see flstory_dipswitches.h FLSTORY_SWA_FLIP_SCREEN_SELECTED -
-  //  so this is the ACTIVE path, not a latent one).
-  //
-  //  Correct model, implemented below: compute tcol/trow/px0/py0 exactly as
-  //  if UNFLIPPED (logical position, from the raster/scroll math only),
-  //  THEN if flip: reflect tcol/trow (32-cell tilemap) to get the MEMORY
-  //  index, and XOR the tile's attribute flip bits with `flip` before
-  //  choosing tile_x/tile_y from px0/py0. px0/py0 themselves are NEVER
-  //  reflected.
-  for (int r = 0; r < 8; r++) {
+   for (int r = 0; r < 8; r++) {
     int fb_line = line0 + r;
     // panel_row -> native mame_x, inverting the fixed formula from this
     // section's header comment (panel_row = FLSTORY_ROW_OFFSET + (FULL_W-1
@@ -1238,57 +832,9 @@ void IRAM_ATTR flstory::blit_bg_strip(short row) {
     int tcol = (world_x >> 3) & 0x1f;
     int px0 = world_x & 7;
 
-    // PERFORMANCE FIX (2026-09-20, "game speed" investigation - see
-    // PROGRESS.md): this loop used to step scr_col one pixel at a time,
-    // redoing the FULL per-pixel chain (VRAM read x2, category/transmask
-    // select, tile_id compute, palette pointer, flip-attr XOR, mcol/mrow
-    // reflect) on EVERY one of the 224 pixels in the row - even though an
-    // 8-wide run of consecutive scr_col values almost always shares the
-    // SAME tile (world_y only crosses an 8-pixel tile boundary once every 8
-    // steps), so all of that work was being redone up to 8x more than
-    // needed. Measured on real hardware at ~23-26ms/frame for this
-    // function alone (see the "game is very slow" comment above this
-    // function) - already over the ENTIRE 16.67ms/frame budget by itself,
-    // before sprites/audio/anything else. gng.cpp's own blit_bg_strip()
-    // (this codebase's proven-fast precedent for an 8/16px-tiled
-    // scrolling background on this exact hardware - see PROGRESS.md's
-    // "gng is a large, performance-sensitive game on the same ESP32
-    // module and runs fine" note) uses exactly this batch-by-tile-run
-    // pattern; restructured to match it: compute the tile lookup ONCE per
-    // up-to-8-pixel run (until either the tile's own 8px span or the
-    // panel's right edge is reached), then only the CHEAP per-pixel pen
-    // lookup + opacity test happens in the inner k-loop.
     int scr_col = 0;
     while (scr_col <= 223) {
-      // panel_col -> native mame_y: panel_col = mame_y - FLSTORY_CLIP_TOP,
-      // NOT reflected (see this section's header comment - the panel's 224
-      // columns match FLSTORY_MAME_FULL_H exactly).
-      //
-      // BUG FIX (2026-09-20, "screen Y axis too large / high-score cut off"
-      // investigation - see PROGRESS.md TO DO #2): this used to read
-      // `mame_y = scr_col` directly, i.e. treating the visible native Y
-      // range as [0,224). Real MAME's own cliprect (screen.set_raw(...,
-      // 2*8, 30*8) = vbend..vbstart = 16..239) makes the visible native Y
-      // range [16,240) instead - a 262-line vtotal with the top 16 and
-      // bottom 22 lines blanked, NOT [0,224). The tilemap itself is a full
-      // 256-tall wraparound (32 rows x 8px) regardless of the cliprect - the
-      // crop is a raster-blanking window, not a tilemap-space boundary - so
-      // sampling starting at native Y=0 instead of Y=16 shifted the whole
-      // picture up by 2 tile-rows (16px): the top 2 tile-rows (title/
-      // high-score text) were pushed off the top of the crop window and the
-      // bottom 2 tile-rows of tilemap content wrapped in to replace them,
-      // while the actual bottom 16px of real content fell outside the crop
-      // entirely. This is the same "sprite anchor happens to already
-      // subtract 16" coincidence noted in scan_sprites (spr.x = mame_y-16) -
-      // that offset is FLSTORY_CLIP_TOP (the cliprect's vbend), not an
-      // arbitrary sprite-height number; the bg strip was simply missing it.
       int mame_y = scr_col + FLSTORY_CLIP_TOP;
-
-      // scrlram is indexed by tilemap COLUMN (set_scroll_cols(32) + a
-      // per-column set_scrolly) - tcol (from mame_x above, LOGICAL/unflipped)
-      // is that column; scrl[tcol] is its Y-scroll value, added to the
-      // native Y coordinate. Real MAME applies set_scrolly() to the
-      // tilemap's own logical column space, same as here.
       int world_y = (mame_y + scrl[tcol & 0x1f]) & 0xff;
       int logical_trow = (world_y >> 3) & 0x1f;
       int py0 = world_y & 7;
@@ -1296,7 +842,6 @@ void IRAM_ATTR flstory::blit_bg_strip(short row) {
       // Reflect LOGICAL (tcol,logical_trow) to the MEMORY (col,row) actually
       // stored in videoram, per tilemap_t::mappings_update()'s
       // `logical_col = (cols-1)-logical_col` / same for row, only when flip
-      // is set - see this function's header comment.
       int mcol = flip ? (31 - tcol) : tcol;
       int mrow = flip ? (31 - logical_trow) : logical_trow;
 
@@ -1334,10 +879,7 @@ void IRAM_ATTR flstory::blit_bg_strip(short row) {
         // matches the original 4-pass call order exactly (see comment
         // above this function).
         //
-        // BUG FIX (2026-09-20, "wizard invisible inside death bubble" - see
-        // PROGRESS.md and this class's own priority_buffer comment in
-        // flstory.h): also record the MAME priority VALUE (1/2/4/8) that
-        // whichever pass drew here would have written into screen.priority()
+        // wizard invisible inside death bubble
         // - a pixel only ever belongs to ONE category (tileinfo.category is
         // a property of the tile occupying that position), so only that
         // category's own front/back values are ever possible here; back
@@ -1362,51 +904,13 @@ void IRAM_ATTR flstory::blit_bg_strip(short row) {
   }
 }
 
-// blit_sprite() - draws sprite s_idx's overlap with the current 8-line band.
-// Sprites are decoded lazily, straight from the RAW flstory_tiles[] ROM
-// bytes, using flstory's REAL spritelayout (source/mame/mame-master/src/
-// mame/taito/flstory.cpp): 16x16, RGN_FRAC(1,2), same interleaved-nibble/
-// two-region-half bit packing as charlayout (see flstory_tilemap.h's own
-// header comment for the exact formula and the evidence that a naive
-// "generic 4-equal-quarters" decode is WRONG for this ROM) but at 16x16 /
-// code*64*8-bits-per-tile instead of 8x8 / code*16*8. Decoding straight from
-// the raw ROM bytes here (rather than a pre-decoded header like
-// flstory_tilemap.h) keeps flash usage down - flstory_tiles[] is 0x20000
-// bytes; a fully pre-decoded 16x16x4bpp table for all 1024 possible sprite
-// codes would be ~2MB (16*16*1024 bytes), clearly not flash-resident-const-
-// array-sized for this target - and a sprite is only ever a few 16x16
-// lookups per on-screen instance per frame, so runtime decode-on-blit costs
-// nothing that matters.
-// NOTE: flstory_tiles[] is the RAW "tiles" ROM_REGION bytes, straight from
-// the dump - it does NOT have MAME's ROM_REGION(..., ROMREGION_INVERT) post-
-// load step applied (verified byte-for-byte against the source zip: e.g.
-// vid-a45.18 offset 0x40 reads 2C 50 2C 90... identically in both the raw
-// ROM file and this array). MAME's real "tiles" region gets every byte
-// XORed with 0xFF right after loading, before gfxdecode (or anything else)
-// ever reads it - flstory_romconv_all.py's own build_tiles_region()
-// reproduces that XOR when generating flstory_tilemap.h/flstory_tiles16.h
-// from the same ROMs, which is how that bug was first found and confirmed
-// (decoding a known tile with vs without the XOR: only the XORed version
-// produces a coherent glyph/sprite shape, verified against real pixel
-// output). Since this function reads flstory_tiles[] directly instead of
-// going through either of those corrected headers, it must invert the bit
-// itself here (equivalent to inverting the source byte before testing it).
 static inline unsigned char flstory_sprite_readbit(const unsigned char *data, unsigned int bitnum) {
   return (data[bitnum >> 3] & (0x80 >> (bitnum & 7))) ? 0 : 1;
 }
 
 // MAME's literal spritelayout xoffset/yoffset tables (source/mame/mame-
 // master/src/mame/taito/flstory.cpp), transcribed verbatim rather than
-// re-derived from a perceived pattern - a previous version of this function
-// tried to extend the first-8-entries formula algebraically to entries 8-15
-// (assuming a simple "+8" continuation) and got BOTH tables wrong: real
-// xoffs[8..15] = {131,130,129,128,139,138,137,136} (base 16*8=128, not 8),
-// and real yoffs[8..15] = {256,272,...,368} (base 16*16=256, not 16*8=128).
-// Caught by cross-decoding a known sprite two independent ways (this
-// function's formula vs flstory_romconv_all.py's build_sprites16(), which
-// encodes the same arrays as plain Python literals) and finding the
-// right/bottom halves of the sprite diverged between the two - the literal
-// tables below are verified to agree with build_sprites16()'s output.
+// re-derived from a perceived pattern
 static const unsigned int FLSTORY_SPRITE_XOFF[16] = {
   3, 2, 1, 0, 8 + 3, 8 + 2, 8 + 1, 8 + 0,
   16 * 8 + 3, 16 * 8 + 2, 16 * 8 + 1, 16 * 8 + 0,
@@ -1458,24 +962,7 @@ void IRAM_ATTR flstory::blit_sprite(short row, unsigned char s_idx) {
   int dy0 = (s->y < y_strip) ? (y_strip - s->y) : 0;
   int dy1 = (s->y + 16 > y_strip + 8) ? (y_strip + 8 - s->y) : 16;
 
-  // NOTE (2026-09-20, orientation investigation - see notes.txt): this
-  // panel maps MAME's X axis to the panel ROW axis and MAME's Y axis to
-  // the panel COLUMN axis (see scan_sprites()'s spr.y/spr.x assignment,
-  // and blit_bg_strip()'s matching mame_x/mame_y derivation - tile_x
-  // there samples along the ROW-direction offset and tile_y samples
-  // along the COLUMN-direction offset). flstory_tiles16[code][y][x] is
-  // generated by flstory_romconv_all.py's mame_decode() with y = MAME
-  // native-Y-within-sprite (xoffs/yoffs straight from real MAME's
-  // spritelayout - see that function's own header comment), x = MAME
-  // native-X-within-sprite - so this array's FIRST index (this function's
-  // "tile_y") must be driven by the COLUMN-direction offset (dx, since
-  // panel column = native Y), and its SECOND index ("tile_x") by the
-  // ROW-direction offset (dy, since panel row = native X). That axis
-  // pairing itself was already correct here (a previous version of this
-  // function had it backwards - see the superseded comment this replaces).
-  //
-  // BUG FIX (2026-09-20, "FG rotation / 2-piece sprite" investigation - see
-  // PROGRESS.md TO DO #3): two separate bugs in HOW each axis's offset was
+  //HOW each axis's offset was
   // read, both now re-derived from scan_sprites()'s corrected spr.y anchor
   // (see that function's own BUG FIX comment) instead of guessed/kept as
   // they were:
@@ -1516,33 +1003,9 @@ void IRAM_ATTR flstory::blit_sprite(short row, unsigned char s_idx) {
       if (scr_x < 0 || scr_x >= 224)
         continue;
       int tile_y = s->flip_y ? (15 - dx) : dx;
-      // BUG FIX (2026-09-20, "game is very slow" investigation - see
-      // notes.txt): flstory_decode_sprite_pixel() did a live 4-bit-plane
-      // decode from the flash-resident raw ROM (flstory_tiles[]) on
-      // EVERY sprite pixel, every frame - same class of bug that took
-      // swtht2nz from 6fps to 61fps when fixed. flstory_tiles16.h already
-      // contains a PRE-DECODED table (flstory_tiles16[code][y][x], direct
-      // pen values, same xoffs/yoffs/planes convention verified against
-      // flstory_romconv_all.py's build_sprites16()/mame_decode()) but was
-      // never wired in. One array read now, instead of 4 bit-decode reads.
       unsigned char pen = flstory_tiles16[code][tile_y][tile_x];
       if (pen == 15)
         continue;
-      // BUG FIX (2026-09-20, "wizard invisible inside death bubble" - see
-      // PROGRESS.md and this class's own priority_buffer comment in
-      // flstory.h): reproduce gfx_element::prio_transpen()'s exact
-      // occlusion test (drawgfxt.ipp's PIXEL_OP_REBASE_TRANSPEN_PRIORITY)
-      // instead of drawing unconditionally. s->priority (from
-      // scan_sprites()'s `(pr&0x80)?1:0`) selects the same pmask real MAME
-      // uses: pr&0x80 set -> only occluded by a category-1/back (value 8)
-      // background pixel; pr&0x80 clear -> occluded by EITHER category's
-      // back layer (4 or 8). Every sprite ALSO forces bit 31 into its own
-      // pmask (screen.priority()'s "already-claimed" marker), so a pixel
-      // already opaquely painted by an EARLIER sprite in this same
-      // draw-order (priority==31) blocks every later sprite regardless of
-      // category - this is what actually fixes the bubble bug (two large
-      // overlapping sprites, drawn in an order where the later one used to
-      // unconditionally paint over the earlier one).
       unsigned char pixel_pri = pri_row[scr_x];
       bool occluded = (pixel_pri == 31) ||
                       (pixel_pri == 8) ||
@@ -1554,63 +1017,21 @@ void IRAM_ATTR flstory::blit_sprite(short row, unsigned char s_idx) {
   }
 }
 
-#ifdef FLSTORY_SERIAL_DEBUG
-// TEMPORARY (2026-09-20, "game is very slow" investigation - see
-// notes.txt): render-path profiling, added after the game_started fix
-// exposed that rendering is comparably expensive to run_frame() itself,
-// and was invisible before because run_frame() ran unthrottled and ahead
-// of real video timing. Splits scan_sprites/blit_bg_strip/blit_sprite
-// cost across all 36 render_row() calls that make up one frame, reported
-// once every 60 frames (called from render_row() only on its last row).
-static void flstory_render_debug_report(uint32_t scan_us, uint32_t bg_us, uint32_t sprite_us) {
-  static uint32_t sum_scan = 0, sum_bg = 0, sum_sprite = 0, n = 0;
-  sum_scan += scan_us;
-  sum_bg += bg_us;
-  sum_sprite += sprite_us;
-  n++;
-  if (n >= 60) {
-    Serial.printf("[flstory] render us/frame: scan=%lu bg=%lu sprite=%lu\n",
-                  (unsigned long)(sum_scan / n), (unsigned long)(sum_bg / n), (unsigned long)(sum_sprite / n));
-    sum_scan = 0; sum_bg = 0; sum_sprite = 0; n = 0;
-  }
-}
-#endif
-
 void IRAM_ATTR flstory::render_row(short row) {
   int line0 = row * 8;
-
-#ifdef FLSTORY_SERIAL_DEBUG
-  static uint32_t dbg_scan_us = 0, dbg_bg_us = 0, dbg_sprite_us = 0;
-  uint32_t dbg_r_t0;
-#endif
-
   if (row == 0) {
     m_render_vram = vram_front;
     m_render_palette = palette_front;
     m_render_spriteram = spriteram_front;
     m_render_scrlram = scrlram_front;
     m_render_flip = m_flip;
-#ifdef FLSTORY_SERIAL_DEBUG
-    dbg_scan_us = 0; dbg_bg_us = 0; dbg_sprite_us = 0;
-    dbg_r_t0 = micros();
-#endif
+
     scan_sprites();
-#ifdef FLSTORY_SERIAL_DEBUG
-    dbg_scan_us += micros() - dbg_r_t0;
-#endif
   }
 
   if (line0 + 8 <= FLSTORY_ROW_OFFSET || line0 >= FLSTORY_ROW_OFFSET + FLSTORY_MAME_FULL_W) {
-#ifdef FLSTORY_SERIAL_DEBUG
-    dbg_r_t0 = micros();
-#endif
     for (unsigned char s = 0; s < active_sprites; s++)
       blit_sprite(row, s);
-#ifdef FLSTORY_SERIAL_DEBUG
-    dbg_sprite_us += micros() - dbg_r_t0;
-    if (row == 35)
-      flstory_render_debug_report(dbg_scan_us, dbg_bg_us, dbg_sprite_us);
-#endif
     return;
   }
 
@@ -1618,30 +1039,12 @@ void IRAM_ATTR flstory::render_row(short row) {
   // draw(cat0,LAYER1)/draw(cat1,LAYER1)/draw(cat0,LAYER0)/draw(cat1,LAYER0)
   // passes internally, in ONE per-pixel pass instead of 4 - see its own
   // header comment for the collapse fix and the verified draw-order
-  // preservation (2026-09-20, "game is very slow" investigation).
-#ifdef FLSTORY_SERIAL_DEBUG
-  dbg_r_t0 = micros();
-#endif
-  blit_bg_strip(row);
-#ifdef FLSTORY_SERIAL_DEBUG
-  dbg_bg_us += micros() - dbg_r_t0;
-  dbg_r_t0 = micros();
-#endif
+  // preservation.
 
+  blit_bg_strip(row);
   for (unsigned char s = 0; s < active_sprites; s++)
     blit_sprite(row, s);
-#ifdef FLSTORY_SERIAL_DEBUG
-  dbg_sprite_us += micros() - dbg_r_t0;
-  if (row == 35)
-    flstory_render_debug_report(dbg_scan_us, dbg_bg_us, dbg_sprite_us);
-#endif
 }
-
-// No known hiscore.dat entry for "flstory" was found (checked MAME's own
-// plugins/hiscore/hiscore.dat under mame/mame-master - see final report).
-// Returning *count=0 (machineBase's own default behaviour) rather than
-// inventing addresses.
-
 // ============================================================================
 // Sound.
 //
@@ -1665,6 +1068,15 @@ void IRAM_ATTR flstory::render_row(short row) {
 // as a template here.
 // ============================================================================
 
+// --- Persistent high scores -------------------------------------------------
+const hiscore_region_S *flstory::hiscoreRegions(unsigned char *count) {
+  static const hiscore_region_S regions[] = {
+    { 0xe74e, 0x23, 0x00, 0x44 },
+  };
+  *count = sizeof(regions) / sizeof(regions[0]);
+  return regions;
+}
+
 void flstory::sound_control_0_w(unsigned char data) {
   // TA7630 volume group1 (MSM5232 channels 0-3). Real TA7630 volume law is
   // a nonlinear (roughly -2dB/step) attenuation table; approximated here as
@@ -1680,7 +1092,6 @@ void flstory::sound_control_0_w(unsigned char data) {
 
 void flstory::sound_control_1_w(unsigned char data) {
   // TA7630 volume group2 (MSM5232 channels 4-7). See sound_control_0_w()'s
-  // TODO above; same simplification applies here.
   snd_ctrl1 = data;
 }
 
@@ -1909,21 +1320,6 @@ static float flstory_msm_freq_8prime_compute(unsigned char pitch7, uint32_t chip
   return (float)freq;
 }
 
-// BUG FIX (2026-09-20, "audio pileup" investigation - see notes.txt):
-// renderFmSample() (below) calls this once per GATED-ON channel, per 24kHz
-// output sample - up to 8 calls/sample, 24000 samples/sec. The original
-// version did a live double-precision divide every call; the ESP32's FPU is
-// single-precision only, so every one of those divides was emulated in
-// software at several microseconds each - with several channels gated on
-// (an actual in-game melody, not silence), this alone could cost over a
-// millisecond of real CPU time per output sample, compounding into the
-// ~1s/s "audio=" stalls seen in logs/capture.txt whenever the audio Z80 (the
-// only thing that ever changes group_select/pitch7) was itself starved and
-// stopped feeding new values, i.e. exactly the same stuck channels kept
-// re-paying this cost sample after sample. flstory_msm_freq_8prime() only
-// depends on a 7-bit pitch7 input and the fixed MSM_CLOCK - a 128-entry
-// table computed ONCE (lazily, on first use) turns the whole per-sample
-// hot path into a plain array index, eliminating the double math entirely.
 static float flstory_msm_freq_8prime(unsigned char pitch7, uint32_t chip_clock) {
   static float table[128];
   static bool table_built = false;
@@ -2015,3 +1411,17 @@ int flstory::renderFmSample() {
 
   return (int)mix;
 }
+
+const unsigned short *flstory::logo(void) {
+  return flstory_logo;
+}
+
+#ifdef LED_PIN
+void flstory::menuLeds(CRGB *leds) {
+  memcpy(leds, menu_leds, NUM_LEDS * sizeof(CRGB));
+}
+
+void flstory::gameLeds(CRGB *leds) {
+  memcpy(leds, menu_leds, NUM_LEDS * sizeof(CRGB));
+}
+#endif
