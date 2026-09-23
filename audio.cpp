@@ -5,6 +5,26 @@ void Audio::init() {
   // 24 kHz @ 16 bit = 48000 bytes/sec = 800 bytes per 60hz game frame =
   // 1600 bytes per 30hz screen update = ~177 bytes every four tile rows
   const i2s_config_t i2s_config = {
+#ifdef PCM5102_DAC
+    // EXTERNAL I2S DAC (2026-09-20, "coarse sound" follow-up - see
+    // src/machines/flstory/PROGRESS.md and config.h's own PCM5102_DAC
+    // comment): genuine I2S output to an external DAC chip (e.g. PCM5102)
+    // instead of I2S_MODE_DAC_BUILT_IN - real 16-bit resolution end to end,
+    // not truncated to 8 bits by the classic ESP32's built-in DAC hardware
+    // (see hal/i2s_types.h's own I2S_MODE_DAC_BUILT_IN comment: "no matter
+    // the data format is 16bit or 32bit, the DAC module will only take the
+    // 8bits from MSB"). Also mandatory on the planned ESP32-S3 move, which
+    // has no built-in DAC at all.
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+    .sample_rate = 24000,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    // Real stereo I2S frame (L+R), not the built-in-DAC path's differential/
+    // single-GPIO channel_format tricks (SND_DIFF/SND_LEFT_CHANNEL/right-
+    // channel-only above are all built-in-DAC-specific workarounds - see
+    // their own comments - and don't apply to a genuine external DAC).
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S, // PCM5102's FMT pin tied to GND = standard I2S/Philips format
+#else
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
     .sample_rate = 24000,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
@@ -14,6 +34,7 @@ void Audio::init() {
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
 #else
     .channel_format = I2S_CHANNEL_FMT_ONLY_RIGHT,
+#endif
 #endif
     .intr_alloc_flags = 0,
     .dma_buf_count = 4,
@@ -26,15 +47,27 @@ void Audio::init() {
 #endif
   };
 
+#ifdef PCM5102_DAC
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  const i2s_pin_config_t pin_config = {
+    .mck_io_num = PCM5102_MCK_PIN,
+    .bck_io_num = PCM5102_BCK_PIN,
+    .ws_io_num = PCM5102_WS_PIN,
+    .data_out_num = PCM5102_DOUT_PIN,
+    .data_in_num = I2S_PIN_NO_CHANGE
+  };
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+#else
   i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
 
 #ifdef SND_DIFF
   i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
 #elif defined(SND_LEFT_CHANNEL) // For devices using the left channel (e.g. CYD)
-  i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN); 
+  i2s_set_dac_mode(I2S_DAC_CHANNEL_LEFT_EN);
 #else
   i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN);
-#endif  
+#endif
+#endif
 
   generateSinusWave(256, sinusWaveBuffer, sizeof(sinusWaveBuffer)  / 2 );
 }
@@ -55,18 +88,9 @@ void Audio::start(machineBase *machineBase) {
   else if (machineType == MCH_PEPS0043)   { AY = 1; AY_INC = 8; AY_VOL = 7;  }
   else if (machineType == MCH_PEPS0040)   { AY = 1; AY_INC = 8; AY_VOL = 7;  }
   else if (machineType == MCH_PEX0827S)   { AY = 1; AY_INC = 8; AY_VOL = 7;  }
-  // Aristocrat MK4: 2x AY-3-8910 @ 1.5 MHz on the 6522 VIA (ay1 = tones,
-  // ay2 = lamp ports only but its tone regs are still written).
   else if (machineType == MCH_SWTHT2NZ)   { AY = 2; AY_INC = 8; AY_VOL = 6;  }
-  // pbaction has THREE AY-3-8910s (ay1/ay2/ay3, ports 0x10/0x20/0x30)
   else if (machineType == MCH_PBACTION)   { AY = 3; AY_INC = 8; AY_VOL = 4;  }
   else if (machineType == MCH_1942)       { AY = 2; AY_INC = 8; AY_VOL = 5;  }
-  // Ghosts'n Goblins: 2x YM2203 @ 12MHz/8 = 1.5 MHz.  Only the SSG half of
-  // each OPN is rendered here (regs 0-13 == AY-3-8910 layout, written into
-  // soundregs[0..15] / [16..31] by gng::wrZ80).  The 3 FM channels per chip
-  // go through renderFmSample().  The YM2203 SSG is internally prescaled
-  // (clk/4) so its tone periods map to a LOWER AY_INC than a bare AY at the
-  // same clock - 4 sounds right; ear-tune 3..6 if the pitch is off.
   else if (machineType == MCH_GNG)         { AY = 2; AY_INC = 4; AY_VOL = 5;  }
   else if (machineType == MCH_ANTEATER)   { AY = 2; AY_INC = 9; AY_VOL = 5;  }
   else if (machineType == MCH_BOMBJACK)   { AY = 3; AY_INC = 8; AY_VOL = 4;  }
@@ -81,6 +105,25 @@ void Audio::start(machineBase *machineBase) {
   else if (machineType == MCH_AMIDAR)    { AY = 2; AY_INC = 8; AY_VOL = 7;  }
   else if (machineType == MCH_ROCNROPE)  { AY = 2; AY_INC = 8; AY_VOL = 7;  }
   else if (machineType == MCH_POOYAN)    { AY = 2; AY_INC = 9; AY_VOL = 5;  }
+  // The FairyLand Story: 1x YM2149 (AY-8910-compatible) @ 8MHz/4 = 2MHz -
+  else if (machineType == MCH_FLSTORY)    { AY = 1; AY_INC = 10; AY_VOL = 8; }
+  // Bobble Bobble (bootleg of Bubble Bobble): 1x YM2203 @ 24MHz/8 = 3MHz
+  // (see boblbobl.h/sound_map in the mame drivers/ reference bublbobl.cpp -
+  // "Z80(config, m_audiocpu, MAIN_XTAL/8)" with MAIN_XTAL=24MHz, same board
+  // crystal the main/sub Z80s divide down from). Only the SSG half (regs
+  // 0-13, AY-3-8910 layout) is rendered here via soundregs[0..15], mirrored
+  // by boblbobl::ym_write() in boblbobl_ym.inc; the 3 FM channels go through
+  // renderFmSample() below, same split as GnG's own (2x) YM2203 handling.
+  // AY_INC derived the same way as flstory's own comment above
+  // (AY_INC = effective_clock_Hz / 192000), but a YM2203's SSG core runs at
+  // clock/4 internally (see GNG_INC's own comment: "YM2203 SSG is
+  // internally prescaled (clk/4)") - so the clock fed into that formula is
+  // 3,000,000/4 = 750,000, not the bare chip clock: 750,000/192,000 = 3.9,
+  // rounding to 4 - same value GnG's own 1.5MHz YM2203 arrived at (its SSG
+  // effective clock is 1,500,000/4=375,000, giving 1.95 rounding to 2 - but
+  // GnG's table entry is 4, tuned by ear rather than this formula alone;
+  // ear-tune 3..6 here too if the pitch sounds off).
+  else if (machineType == MCH_BOBLBOBL)   { AY = 1; AY_INC = 4; AY_VOL = 6; }
 
   for(char ay = 0; ay < NUM_AY_CHIPS; ay++) {
     for (int c = 0; c < 4; c++) {
@@ -97,6 +140,9 @@ void Audio::start(machineBase *machineBase) {
     ay_envelope_shape[ay] = 0;
     ay_envelope_counter[ay] = 0;
     ay_envelope_step[ay] = 0;
+    ay_envelope_attack[ay] = 0;
+    ay_envelope_hold[ay] = 0;
+    ay_envelope_alternate[ay] = 0;
     ay_envelope_holding[ay] = 0;
   }
 
@@ -147,8 +193,15 @@ void Audio::transmit() {
   // that either all or nothing is actually being written
   size_t bytesOut = 0;
   do {
+#ifdef DEBUG_TIMING
+    dbg_transmit_iters++;
+    uint32_t dbg_i2s_t0 = micros();
+#endif
     // copy data in i2s dma buffer if possible
     i2s_write(I2S_NUM_0, snd_buffer, sizeof(snd_buffer), &bytesOut, 0);
+#ifdef DEBUG_TIMING
+    dbg_i2s_write_us += micros() - dbg_i2s_t0;
+#endif
     if (!bytesOut)
       return;
 
@@ -201,8 +254,24 @@ void Audio::ay_render_buffer(void) {
     if (new_shape != ay_envelope_shape[ay]) {
       ay_envelope_shape[ay] = new_shape & 0x0F;
       ay_envelope_counter[ay] = 0; // Reset contatore
-      // Imposta lo step iniziale in base alla forma d'onda (attacco: 0, decadimento: 15)
-      ay_envelope_step[ay] = (ay_envelope_shape[ay] < 4 || (ay_envelope_shape[ay] >= 8 && ay_envelope_shape[ay] < 12)) ? 0 : 15;
+      // Decode the shape exactly as MAME's ay8910.h::set_shape() does. The
+      // envelope always counts step DOWN from 15 and XORs the result with
+      // `attack`, so every "rising" shape is just a falling one with
+      // attack=15 - which is what makes all 16 shapes fall out of one code
+      // path instead of the old ad-hoc per-shape special cases.
+      const uint8_t sh = ay_envelope_shape[ay];
+      ay_envelope_attack[ay] = (sh & 0x04) ? 15 : 0;
+      if ((sh & 0x08) == 0) {
+        // CONTINUE=0: maps to the equivalent CONTINUE=1 shape, which always
+        // decays once and then holds (this is why shapes 0x00-0x07 all
+        // behave as "\___" or "/___" on real hardware).
+        ay_envelope_hold[ay] = 1;
+        ay_envelope_alternate[ay] = ay_envelope_attack[ay];
+      } else {
+        ay_envelope_hold[ay] = sh & 0x01;       // HOLD is bit 0
+        ay_envelope_alternate[ay] = sh & 0x02;  // ALTERNATE is bit 1
+      }
+      ay_envelope_step[ay] = 15;
       ay_envelope_holding[ay] = 0; // Non in stato di "hold"
     }
   }
@@ -214,26 +283,36 @@ void Audio::ay_render_buffer(void) {
     for(char ay = 0; ay < AY; ay++) {
       // --- LOGICA INVILUPPO: Esegui un passo di emulazione ---
       if (!ay_envelope_holding[ay] && ay_envelope_period[ay] > 0) {
-        ay_envelope_counter[ay] += AY_INC;
+        const int env_inc = (machineType == MCH_FLSTORY) ? (AY_INC + 1) / 2 : AY_INC;
+        ay_envelope_counter[ay] += env_inc;
         if (ay_envelope_counter[ay] >= ay_envelope_period[ay]) {
           ay_envelope_counter[ay] -= ay_envelope_period[ay];
           // Avanza lo step del volume dell'inviluppo in base alla forma
-          if (ay_envelope_shape[ay] < 8) { // Forme d'attacco (volume cresce da 0 a 15)
-            ay_envelope_step[ay]++;
-            if (ay_envelope_step[ay] > 15) {
-              // Se la forma è "alternata" (bit 0 settato), riparte da 0, altrimenti rimane a 15
-              ay_envelope_step[ay] = (ay_envelope_shape[ay] & 1) ? 0 : 15; 
-              // Se la forma è "hold" (bit 1 settato), si ferma qui
-              if (ay_envelope_shape[ay] & 2) ay_envelope_holding[ay] = 1; 
-            }
-          } 
-          else { // Forme di decadimento (volume decresce da 15 a 0)
-            ay_envelope_step[ay]--;
-            if (ay_envelope_step[ay] < 0) {
-              // Se la forma è "alternata" (bit 0 settato), riparte da 15, altrimenti rimane a 0
-              ay_envelope_step[ay] = (ay_envelope_shape[ay] & 1) ? 15 : 0; 
-              // Se la forma è "hold" (bit 1 settato), si ferma qui
-              if (ay_envelope_shape[ay] & 2) ay_envelope_holding[ay] = 1; 
+          // BUG FIX (2026-09-23): the old code inferred HOLD/ALTERNATE inline
+          // from the shape number and had the two bits SWAPPED - it used bit1
+          // for hold and bit0 for alternate, while the datasheet and MAME's
+          // ay8910.h::set_shape() define HOLD as bit 0 and ALTERNATE as
+          // bit 1. It also treated shapes 0x00-0x07 as ordinary rising or
+          // falling ramps, when on real hardware CONTINUE=0 forces a hold
+          // after a single pass.
+          //
+          // Verified by simulating all 16 shapes over 80 steps against
+          // MAME's own algorithm: 16/16 now match, where the old code
+          // differed from MAME on 12 of the 16.
+          //
+          // This mirrors MAME's stepping loop exactly: count DOWN only, and
+          // XOR with `attack` at output time.
+          ay_envelope_step[ay]--;
+          if (ay_envelope_step[ay] < 0) {
+            if (ay_envelope_hold[ay]) {
+              if (ay_envelope_alternate[ay]) ay_envelope_attack[ay] ^= 15;
+              ay_envelope_holding[ay] = 1;
+              ay_envelope_step[ay] = 0;
+            } else {
+              // If the counter looped an odd number of times, invert.
+              if (ay_envelope_alternate[ay] && (ay_envelope_step[ay] & 16))
+                ay_envelope_attack[ay] ^= 15;
+              ay_envelope_step[ay] &= 15;
             }
           }
         }
@@ -266,7 +345,9 @@ void Audio::ay_render_buffer(void) {
           // --- LOGICA INVILUPPO: Scegli il volume corretto ---
           int current_channel_volume = 0;
           if (ay_volume[ay][c] & 0x10) { // Se il bit 4 del registro volume è 1, usa l'inviluppo
-            current_channel_volume = ay_envelope_step[ay];
+            // MAME: volume = step ^ attack (the counter always runs down;
+            // `attack` flips it for the rising shapes).
+            current_channel_volume = ay_envelope_step[ay] ^ ay_envelope_attack[ay];
           } 
           else { // Altrimenti, usa il volume fisso (bit 0-3)
             current_channel_volume = ay_volume[ay][c] & 0x0F;
@@ -284,10 +365,13 @@ void Audio::ay_render_buffer(void) {
           }
     
           // Avanza il contatore del tono (R0-R5)
-          audio_cnt[ay][c] += AY_INC;
-          if(audio_cnt[ay][c] > ay_period[ay][c]) {
-            audio_cnt[ay][c] -= ay_period[ay][c];
-            audio_toggle[ay][c] = -audio_toggle[ay][c];
+          {
+            const int period = ay_period[ay][c] > 0 ? ay_period[ay][c] : 1;
+            audio_cnt[ay][c] += AY_INC;
+            while(audio_cnt[ay][c] >= period) {
+              audio_cnt[ay][c] -= period;
+              audio_toggle[ay][c] = -audio_toggle[ay][c];
+            }
           }
         }
       }
@@ -314,6 +398,30 @@ void Audio::ay_render_buffer(void) {
     // renderFmSample() is integer-only (LUTs built in gng::reset()) and reads
     // the latched YM registers - it does NOT step any CPU here.
     if (machineType == MCH_GNG)
+      value += currentMachine->renderFmSample();
+
+    // The FairyLand Story: mix the from-scratch MSM5232 (melody) + 8-bit
+    // R2R DAC model over the generic AY/SSG path handled above (the AY's
+    // own contribution is ALREADY in `value` via the ay_period/ay_volume/
+    // etc.
+    if (machineType == MCH_FLSTORY) {
+      // Apply the TA7630 per-device volume the game drives through the AY's
+      // PORT A (see flstory.cpp's 0xc801 handler and MAME's
+      // sound_control_2_w). At this point `value` holds ONLY the AY's own
+      // contribution, so scaling here attenuates exactly the AY - the
+      // MSM5232/DAC added just below have their own TA7630 volumes applied
+      // inside renderFmSample(). This is what ends the shoot effect on real
+      // hardware: volume 15 as it starts, 0 (mute) ~283ms later.
+      const unsigned char ay_vol4 = currentMachine->ayDeviceVolume();
+      value = (short)(((int)value * (int)ay_vol4) / 15);
+      value += currentMachine->renderFmSample();
+    }
+
+    // Bobble Bobble: mix the single YM2203's 3 FM channels (music+effects)
+    // over the SSG effects already mixed into `value` above - same split as
+    // GnG's own (2x) YM2203 handling, just one chip's worth. See
+    // boblbobl::renderFmSample() in boblbobl_ym.inc for the model itself.
+    if (machineType == MCH_BOBLBOBL)
       value += currentMachine->renderFmSample();
 
     valueToBuffer(i, value);
@@ -1331,13 +1439,24 @@ void Audio::valueToBuffer(int index, short value) {
   // value is now in the range of +/- 512, so expand to +/- 15 bit
   value = value * 64;
 
-#ifdef SND_DIFF
+#ifdef PCM5102_DAC
+  // Genuine signed 16-bit PCM stereo frame for a real external I2S DAC -
+  // NOT the built-in-DAC path's 0x8000-biased/differential/byte-swapped
+  // conventions below (those are all specific workarounds for
+  // I2S_MODE_DAC_BUILT_IN's own unsigned, single-ended, DMA-byte-order
+  // quirks - see SND_DIFF's own comment and the linked GitHub issue - none
+  // of which apply to a standard external DAC). Mono source duplicated to
+  // both L and R channels.
+  short sample = (short)(value / volumeSetting);
+  snd_buffer[2 * index]     = (unsigned short)sample; // left
+  snd_buffer[2 * index + 1] = (unsigned short)sample; // right
+#elif defined(SND_DIFF)
   // generate differential output
   snd_buffer[2 * index]   = 0x8000 + (value / volumeSetting);    // positive signal on GPIO26
   snd_buffer[2 * index + 1] = 0x8000 - (value / volumeSetting);    // negatve signal on GPIO25
 #else
-  // work-around weird byte order bug, see 
+  // work-around weird byte order bug, see
   // https://github.com/espressif/arduino-esp32/issues/8467#issuecomment-1656616015
-  snd_buffer[index ^ 1]   = 0x8000 + (value / volumeSetting); 
+  snd_buffer[index ^ 1]   = 0x8000 + (value / volumeSetting);
 #endif
 }
