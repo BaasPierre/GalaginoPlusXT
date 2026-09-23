@@ -107,23 +107,9 @@ void Audio::start(machineBase *machineBase) {
   else if (machineType == MCH_POOYAN)    { AY = 2; AY_INC = 9; AY_VOL = 5;  }
   // The FairyLand Story: 1x YM2149 (AY-8910-compatible) @ 8MHz/4 = 2MHz -
   else if (machineType == MCH_FLSTORY)    { AY = 1; AY_INC = 10; AY_VOL = 8; }
-  // Bobble Bobble (bootleg of Bubble Bobble): 1x YM2203 @ 24MHz/8 = 3MHz
-  // (see boblbobl.h/sound_map in the mame drivers/ reference bublbobl.cpp -
-  // "Z80(config, m_audiocpu, MAIN_XTAL/8)" with MAIN_XTAL=24MHz, same board
-  // crystal the main/sub Z80s divide down from). Only the SSG half (regs
-  // 0-13, AY-3-8910 layout) is rendered here via soundregs[0..15], mirrored
-  // by boblbobl::ym_write() in boblbobl_ym.inc; the 3 FM channels go through
-  // renderFmSample() below, same split as GnG's own (2x) YM2203 handling.
-  // AY_INC derived the same way as flstory's own comment above
-  // (AY_INC = effective_clock_Hz / 192000), but a YM2203's SSG core runs at
-  // clock/4 internally (see GNG_INC's own comment: "YM2203 SSG is
-  // internally prescaled (clk/4)") - so the clock fed into that formula is
-  // 3,000,000/4 = 750,000, not the bare chip clock: 750,000/192,000 = 3.9,
-  // rounding to 4 - same value GnG's own 1.5MHz YM2203 arrived at (its SSG
-  // effective clock is 1,500,000/4=375,000, giving 1.95 rounding to 2 - but
-  // GnG's table entry is 4, tuned by ear rather than this formula alone;
-  // ear-tune 3..6 here too if the pitch sounds off).
-  else if (machineType == MCH_BOBLBOBL)   { AY = 1; AY_INC = 4; AY_VOL = 6; }
+  // Bobble Bobble: no AY path. The machine renders its YM2203 (FM + SSG)
+  // and YM3526 itself in renderFmSample() (see boblbobl.cpp / boblbobl_fm.h),
+  // dispatched from transmit() below.
 
   for(char ay = 0; ay < NUM_AY_CHIPS; ay++) {
     for (int c = 0; c < 4; c++) {
@@ -228,6 +214,8 @@ void Audio::transmit() {
       phoenix_render_buffer();
     else if (machineType == MCH_RADIO)
       radio_render_buffer();
+    else if (machineType == MCH_BOBLBOBL)
+      boblbobl_render_buffer();
   } while(bytesOut);
 }
 
@@ -416,13 +404,6 @@ void Audio::ay_render_buffer(void) {
       value = (short)(((int)value * (int)ay_vol4) / 15);
       value += currentMachine->renderFmSample();
     }
-
-    // Bobble Bobble: mix the single YM2203's 3 FM channels (music+effects)
-    // over the SSG effects already mixed into `value` above - same split as
-    // GnG's own (2x) YM2203 handling, just one chip's worth. See
-    // boblbobl::renderFmSample() in boblbobl_ym.inc for the model itself.
-    if (machineType == MCH_BOBLBOBL)
-      value += currentMachine->renderFmSample();
 
     valueToBuffer(i, value);
   }
@@ -1429,6 +1410,14 @@ void Audio::dkong3_render_buffer(void) {
 // found while investigating "still no music" after fixing several AAC
 // decoder bugs upstream of this.
 void Audio::radio_render_buffer(void) {
+  for (int i = 0; i < 64; i++)
+    valueToBuffer(i, currentMachine->renderFmSample());
+}
+
+// Bobble Bobble: the machine renders its YM2203 (FM + SSG) and YM3526 itself
+// (boblbobl.cpp / boblbobl_fm.h); renderFmSample() returns the full mix,
+// one 24kHz sample per call, already scaled to +/-512.
+void Audio::boblbobl_render_buffer(void) {
   for (int i = 0; i < 64; i++)
     valueToBuffer(i, currentMachine->renderFmSample());
 }
