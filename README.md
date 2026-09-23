@@ -15,13 +15,15 @@ Sound is not 100% emulated
 
 Note: Ghosts'n Goblins is natively a horizontal/landscape game.
 
+The Fairyland Story (flstory)
+
 These builds is for landscape.
 
 Rotation can be added.
 
 Enjoy!
 
-Ps, regards to edits in audio.cpp file you need to diff out to see the changes, but for other edits like machines.h (<#ifdef ENABLE_PBACTION
+Ps, regards to edits in audio.cpp file you need to diff out to see the changes, but for other edits like machines.h files add example (<#ifdef ENABLE_PBACTION
 
 #include "machines/pbaction/pbaction.h"
 
