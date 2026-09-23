@@ -80,7 +80,18 @@ public:
   void prepare_frame(void) override;
   void render_row(short row) override;
   const unsigned short *logo(void) override { return boblbobl_logo; }
-  const char *hiscoreKey() override { return 0; }
+  const char *hiscoreKey() override { return "boblbobl"; }
+  const hiscore_region_S *hiscoreRegions(unsigned char *count) override;
+  // High score RAM is the main CPU's (e000-f7ff): read/write through its map
+  // directly - rdZ80/wrZ80 route by current_cpu, which may be sub or sound.
+  unsigned char hiscoreRead(unsigned short addr) override { return main_rd(addr); }
+  void hiscoreWrite(unsigned short addr, unsigned char value) override { main_wr(addr, value); }
+#ifdef LED_PIN
+  void menuLeds(CRGB *leds) override;
+  void gameLeds(CRGB *leds) override;
+  // Bub (green) and Bob (blue)
+  const CRGB menu_leds[7] = { LED_GREEN, LED_BLUE, LED_GREEN, LED_CYAN, LED_GREEN, LED_BLUE, LED_GREEN };
+#endif
 
 public:
   int renderFmSample() override;
