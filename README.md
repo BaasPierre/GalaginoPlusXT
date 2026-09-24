@@ -3,11 +3,15 @@ New games for galaginoplus
 This port is NOT by the original authors, so please do not bother them with issues.
 Also i do have custom controllers for my games
 
+
+Recommended to use an ESP32 S3 cause of memmory restrictions
+
 Used [GalaginoPlus - VirtualClaudioBoy](https://github.com/VirtualClaudioBoy/GalaginoPlus)
 
 Games added here:
 
 Pinball Action
+
 
 Ghost n Goblins
 
@@ -15,7 +19,14 @@ Sound is not 100% emulated
 
 Note: Ghosts'n Goblins is natively a horizontal/landscape game.
 
+
 The Fairyland Story (flstory)
+
+
+Bubblebobble (boblbobl)
+
+It uses the parent rom from bublbubl, you need to merge the roms with boblbobl into a single boblbobl.zip file 
+
 
 These builds is for landscape.
 
