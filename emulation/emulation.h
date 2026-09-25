@@ -5,7 +5,7 @@
 #include "cpus/i8048/i8048.h"
 #include "cpus/m6809/m6809.h"
 
-// #define DEBUG_TIMING  // enable for debug
+ #define DEBUG_TIMING  // enable for debug
 
 #ifdef DEBUG_TIMING
 static int counter;

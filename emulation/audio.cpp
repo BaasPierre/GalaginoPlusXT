@@ -221,6 +221,8 @@ void Audio::transmit() {
       radio_render_buffer();
     else if (machineType == MCH_BOBLBOBL)
       boblbobl_render_buffer();
+    else if (machineType == MCH_MPATROL)   // renders its own mix (mpatrol.cpp "Sound output")
+      boblbobl_render_buffer();
   } while(bytesOut);
 }
 
