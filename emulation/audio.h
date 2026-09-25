@@ -113,6 +113,7 @@ private:
   char ay_envelope[NUM_AY_CHIPS][3];
   int ay_envelope_period[NUM_AY_CHIPS];
   uint8_t ay_envelope_shape[NUM_AY_CHIPS];
+  uint8_t ay_envelope_restarts[NUM_AY_CHIPS];   // last machineBase::ayEnvelopeRestarts()
   int ay_envelope_counter[NUM_AY_CHIPS];
   int ay_envelope_step[NUM_AY_CHIPS];
   int ay_envelope_holding[NUM_AY_CHIPS];

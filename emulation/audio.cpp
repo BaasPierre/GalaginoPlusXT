@@ -110,6 +110,10 @@ void Audio::start(machineBase *machineBase) {
   // Bobble Bobble: no AY path. The machine renders its YM2203 (FM + SSG)
   // and YM3526 itself in renderFmSample() (see boblbobl.cpp / boblbobl_fm.h),
   // dispatched from transmit() below.
+  // Arkanoid: 1x YM2149 @ 12MHz/4 = 3MHz with pin 26 low (arkanoid.cpp:
+  // YM2149_PIN26_LOW). ay8910.cpp ay_set_clock(): stream rate = clock/16 =
+  // 187500 Hz, one tone count per stream sample -> AY_INC = 187500/24000 = 7.8.
+  else if (machineType == MCH_ARKANOID)   { AY = 1; AY_INC = 8; AY_VOL = 8; }
 
   for(char ay = 0; ay < NUM_AY_CHIPS; ay++) {
     for (int c = 0; c < 4; c++) {
@@ -124,6 +128,7 @@ void Audio::start(machineBase *machineBase) {
 
     ay_envelope_period[ay] = 0;
     ay_envelope_shape[ay] = 0;
+    ay_envelope_restarts[ay] = currentMachine->ayEnvelopeRestarts(ay);
     ay_envelope_counter[ay] = 0;
     ay_envelope_step[ay] = 0;
     ay_envelope_attack[ay] = 0;
@@ -239,7 +244,9 @@ void Audio::ay_render_buffer(void) {
 
     // Rileva un cambio di forma d'onda (R13) per triggerare l'inviluppo
     uint8_t new_shape = currentMachine->soundregs[ay_off + 13];
-    if (new_shape != ay_envelope_shape[ay]) {
+    uint8_t restarts = currentMachine->ayEnvelopeRestarts(ay);
+    if (new_shape != ay_envelope_shape[ay] || restarts != ay_envelope_restarts[ay]) {
+      ay_envelope_restarts[ay] = restarts;
       ay_envelope_shape[ay] = new_shape & 0x0F;
       ay_envelope_counter[ay] = 0; // Reset contatore
       // Decode the shape exactly as MAME's ay8910.h::set_shape() does. The
@@ -271,7 +278,9 @@ void Audio::ay_render_buffer(void) {
     for(char ay = 0; ay < AY; ay++) {
       // --- LOGICA INVILUPPO: Esegui un passo di emulazione ---
       if (!ay_envelope_holding[ay] && ay_envelope_period[ay] > 0) {
-        const int env_inc = (machineType == MCH_FLSTORY) ? (AY_INC + 1) / 2 : AY_INC;
+        // YM2149 (flstory, arkanoid): 32 envelope steps at m_step=1, rendered here
+        // as 16 steps -> half the increment (ay8910.cpp m_step / m_env_step_mask).
+        const int env_inc = (machineType == MCH_FLSTORY || machineType == MCH_ARKANOID) ? (AY_INC + 1) / 2 : AY_INC;
         ay_envelope_counter[ay] += env_inc;
         if (ay_envelope_counter[ay] >= ay_envelope_period[ay]) {
           ay_envelope_counter[ay] -= ay_envelope_period[ay];
