@@ -36,7 +36,7 @@ static inline uint16_t addr_mask(const m6805_state *s, uint16_t addr) {
 static inline uint8_t fetch8(m6805_state *s) {
     uint16_t pc = addr_mask(s, s->PC);
     s->PC = (uint16_t)(s->PC + 1);
-    return m6805_read(s, pc);
+    return s->rd_hook ? s->rd_hook(s, pc) : m6805_read(s, pc);
 }
 
 static inline uint16_t fetch16(m6805_state *s) {
@@ -46,11 +46,12 @@ static inline uint16_t fetch16(m6805_state *s) {
 }
 
 static inline uint8_t rd(m6805_state *s, uint16_t addr) {
-    return m6805_read(s, addr_mask(s, addr));
+    return s->rd_hook ? s->rd_hook(s, addr_mask(s, addr)) : m6805_read(s, addr_mask(s, addr));
 }
 
 static inline void wr(m6805_state *s, uint16_t addr, uint8_t val) {
-    m6805_write(s, addr_mask(s, addr), val);
+    if (s->wr_hook) s->wr_hook(s, addr_mask(s, addr), val);
+    else m6805_write(s, addr_mask(s, addr), val);
 }
 
 static inline uint16_t rd16(m6805_state *s, uint16_t addr) {

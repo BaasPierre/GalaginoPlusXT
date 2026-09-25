@@ -110,6 +110,13 @@ typedef struct m6805_state_S {
      * (MAME's test_il() reads m_irq_state[] directly, not the latch), so
      * this must be updated by m6805_irq() alongside the latch. */
     uint8_t  irq_line_level;
+
+    /* Optional per-instance memory hooks. NULL (what m68705p5_reset() sets)
+     * = use the global m6805_read/m6805_write below. A machine whose MCU must
+     * not go through those globals (they are defined once, by flstory.cpp)
+     * installs its own via m68705p5_reset_hooked(). */
+    uint8_t (*rd_hook)(struct m6805_state_S *s, uint16_t addr);
+    void    (*wr_hook)(struct m6805_state_S *s, uint16_t addr, uint8_t val);
 } m6805_state;
 
 /* Reset the CPU: clears registers, sets CC = I (interrupts masked, matches

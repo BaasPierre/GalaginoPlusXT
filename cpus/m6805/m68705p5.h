@@ -146,6 +146,17 @@ typedef struct m68705p5_state_S {
                                    the timer never fires (matches
                                    silicon/MAME: CLOCK_TIMER source
                                    needs m_timer(external level) too) */
+
+    /* Counts the places where MAME's m6805_timer calls set_input_line(
+     * M6805_INT_TIMER, ...): every TCR write (tcr_w) and every unmasked
+     * timer interrupt (update). In MAME that call is synced: it puts a timer
+     * at that moment and ends the MCU's timeslice. A machine that models
+     * MAME's scheduler watches these to do the same; nothing in the core
+     * depends on them. timer_sync_off is how many cycles into the current
+     * m68705p5_step() the first such call happened (0xff = none yet; the
+     * caller resets it before each step). */
+    uint8_t  timer_line_syncs;
+    uint8_t  timer_sync_off;
 } m68705p5_state;
 
 /* Reset the MCU: clears ports/timer/PCR to power-on defaults and the
@@ -156,6 +167,14 @@ typedef struct m68705p5_state_S {
  * rom[0x784] (MOR, exactly where MAME's m68705p_device::
  * get_mask_options() reads it - see m68705.cpp). */
 void m68705p5_reset(m68705p5_state *s, const uint8_t *rom);
+
+/* Same reset, but the core's memory accesses go to rd/wr instead of the
+ * global m6805_read/m6805_write (see m6805_state.rd_hook). `cpu` is the
+ * first member of m68705p5_state, so a hook may cast its m6805_state* back
+ * to the owning m68705p5_state* and call m68705p5_mem_read/write on it. */
+void m68705p5_reset_hooked(m68705p5_state *s, const uint8_t *rom,
+                           uint8_t (*rd)(m6805_state *, uint16_t),
+                           void (*wr)(m6805_state *, uint16_t, uint8_t));
 
 /* Execute up to `count` instructions. Internally drives the general
  * m6805 core's step loop one instruction at a time so the timer can

@@ -49,7 +49,16 @@ static const uint8_t PORT_MASK[3] = { 0x00, 0x00, 0xf0 };
  * ============================================================ */
 
 void m68705p5_reset(m68705p5_state *s, const uint8_t *rom) {
+    m68705p5_reset_hooked(s, rom, 0, 0);
+}
+
+void m68705p5_reset_hooked(m68705p5_state *s, const uint8_t *rom,
+                           uint8_t (*rd)(m6805_state *, uint16_t),
+                           void (*wr)(m6805_state *, uint16_t, uint8_t)) {
     s->user_rom = rom;
+    /* set before m6805_reset(): it reads the reset vector through them */
+    s->cpu.rd_hook = rd;
+    s->cpu.wr_hook = wr;
 
     memset(s->port_latch, 0xff, sizeof(s->port_latch)); /* m_port_latch{0xff,...} */
     memset(s->port_ddr, 0x00, sizeof(s->port_ddr));       /* port_ddr_w<N>(0x00) on reset */
@@ -90,6 +99,8 @@ void m68705p5_reset(m68705p5_state *s, const uint8_t *rom) {
     s->timer_prescale = 0x7f;
     s->timer_tdr = 0xff;
     s->timer_tcr = 0x7f;
+    s->timer_line_syncs = 0;
+    s->timer_sync_off = 0xff;
 
     m6805_reset(&s->cpu, &M68705P5_CONFIG);
 
@@ -193,6 +204,9 @@ static void timer_tcr_w(m68705p5_state *s, uint8_t data) {
                               (data & (uint8_t)~(M68705P5_TCR_TIR | M68705P5_TCR_PSC)));
 
     /* level-sensitive: raise/lower M6805_INT_TIMER to match TIR && !TIM right now */
+    s->timer_line_syncs++;
+    if (s->timer_sync_off == 0xff)
+        s->timer_sync_off = (uint8_t)s->cpu.cycles;   /* cycles already charged this step */
     if ((s->timer_tcr & M68705P5_TCR_TIR) && !(s->timer_tcr & M68705P5_TCR_TIM))
         s->cpu.pending_interrupts |= (1u << M6805_INT_TIMER);
     else
@@ -201,7 +215,7 @@ static void timer_tcr_w(m68705p5_state *s, uint8_t data) {
 
 /* Advance the timer by `count` CPU cycles (called once per opcode
  * from m68705p5_step(), matching MAME's per-opcode burn_cycles()). */
-static IRAM_ATTR void timer_update(m68705p5_state *s, unsigned count) {
+static IRAM_ATTR void timer_update(m68705p5_state *s, unsigned count, unsigned elapsed) {
     /* DISABLED source doesn't exist in this port (nothing sets it -
        TIMER_MOR/TIMER_PGM both start at CLOCK); the only gate is
        "needs external pin but nothing drives it", which for a Taito
@@ -224,8 +238,12 @@ static IRAM_ATTR void timer_update(m68705p5_state *s, unsigned count) {
 
     if (interrupt) {
         s->timer_tcr |= M68705P5_TCR_TIR;
-        if (!(s->timer_tcr & M68705P5_TCR_TIM))
+        if (!(s->timer_tcr & M68705P5_TCR_TIM)) {
             s->cpu.pending_interrupts |= (1u << M6805_INT_TIMER);
+            s->timer_line_syncs++;
+            if (s->timer_sync_off == 0xff)
+                s->timer_sync_off = (uint8_t)elapsed;
+        }
     }
 }
 
@@ -324,8 +342,19 @@ void m68705p5_mem_write(m68705p5_state *s, uint16_t addr, uint8_t val) {
 int m68705p5_step(m68705p5_state *s, int count) {
     int total = 0;
     for (int i = 0; i < count; i++) {
+        /* MAME's execute_run() burns the 11 cycles of an interrupt entry
+           (interrupt(): burn_cycles(11)) before the opcode's own cycles; the
+           counter ends up the same as one combined update, but a timer
+           interrupt raised during the entry happens 11 cycles in. Same
+           condition as the core's service_interrupt(). */
+        int entry = (s->cpu.pending_interrupts & ((1u << M6805_IRQ_LINE) | (1u << M6805_INT_TIMER))) &&
+                    !(s->cpu.CC & M6805_CC_I);
         int c = m6805_step(&s->cpu, 1);
-        timer_update(s, (unsigned)c);
+        if (entry) {
+            timer_update(s, 11, 11);
+            timer_update(s, (unsigned)(c - 11), (unsigned)c);
+        } else
+            timer_update(s, (unsigned)c, (unsigned)c);
         total += c;
     }
     return total;
