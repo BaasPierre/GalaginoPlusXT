@@ -10,6 +10,7 @@
 #include "boblbobl_logo.h"
 #include "boblbobl_fm.h"
 #include "../machineBase.h"
+#include <atomic>
 
 #define BOBLBOBL_VIDEORAM 0x0000
 #define BOBLBOBL_OBJECTRAM 0x1d00
@@ -53,6 +54,23 @@
 
 #ifndef BOBLBOBL_PROFILE
 #define BOBLBOBL_PROFILE 1
+#endif
+
+// Sound render on the emulation core (boblbobl.cpp renderFmSample): after
+// each frame core 1 renders the frame's samples ahead into a ring until the
+// next frame tick is waiting, or at most this many us after the frame
+// started; core 0 (video + audio) renders only what is left.
+// 0 = everything on core 0 (the old behaviour).
+#ifndef BOBLBOBL_SND_CORE1_US
+#define BOBLBOBL_SND_CORE1_US 40000
+#endif
+
+// Run at the game's own 59.19Hz instead of one frame per display tick
+// (~60Hz): run_frame only emulates when real time has caught up, so the
+// emulation makes exactly the 24000 samples/s the audio core plays. 0 = one
+// frame per display tick (1.4% fast; the audio timeline then has to skip).
+#ifndef BOBLBOBL_REAL_SPEED
+#define BOBLBOBL_REAL_SPEED 1
 #endif
 
 #ifndef BOBLBOBL_ROW_OFFSET
@@ -144,6 +162,23 @@ private:
   // ym_timers_advance(), so their output lines up with emulation time.
   bool snd_sync = false;
 
+  // Output samples rendered ahead on core 1 (renderFmSample, snd_render_ahead);
+  // snd_lock guards the chip state and the event clock above.
+  static const int SND_OUT = 2048;
+  short snd_out[SND_OUT];
+  volatile uint16_t snd_out_wr = 0;
+  volatile uint16_t snd_out_rd = 0;
+  short snd_last = 0;              // last sample played (repeated when nothing emulated is ready)
+  volatile bool snd_core1_busy = false;   // core 1 is in snd_render_ahead (it has priority)
+  std::atomic<uint32_t> snd_lock{0};
+  int snd_render_one(void);
+  void snd_render_ahead(uint32_t t0);
+
+  // BOBLBOBL_REAL_SPEED
+  bool pace_init = false;
+  uint32_t pace_last = 0;
+  int32_t pace_credit = 0;
+
   unsigned char main_rd(unsigned short addr);
   void main_wr(unsigned short addr, unsigned char val);
   unsigned char sub_rd(unsigned short addr);
@@ -155,14 +190,15 @@ private:
   unsigned char m_bank = 0;
   const unsigned char *m_bankptr = boblbobl_maincpu + 0x10000;
 
-  // The three fixed 32KB Z80 ROMs are copied to internal RAM when the heap
-  // allows (flash reads on the emulation core stall behind the video core's
-  // flash traffic). Each falls back to the flash array on its own.
-  const unsigned char *rom_main = boblbobl_maincpu;   // 0x0000-0x7fff
-  const unsigned char *rom_sub = boblbobl_subcpu;
-  const unsigned char *rom_audio = boblbobl_audiocpu;
-  unsigned char *rom_ram[3] = {0, 0, 0};
+  // The three fixed 32KB Z80 ROMs are copied to internal RAM in 8KB pieces
+  // when the heap allows (flash reads on the emulation core stall behind the
+  // video core's flash traffic); each piece falls back to flash on its own.
+  // The CPUs reach them through the page tables (boblbobl_z80.c).
+  unsigned char *rom_ram[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};   // audio, main, sub
   void roms_to_ram(void);
+  void build_pages(void);
+  void set_bank_pages(void);
+  void set_cpu(int c);
 
   bool sub_held_reset = true;
 
@@ -284,6 +320,7 @@ public:
   // kind 0: FM tick (a = YM2203 FM, b = YM3526); kind 1: SSG tick (a, b, c = channels)
   void (*dbg_fm_hook)(int kind, int32_t a, int32_t b, int32_t c) = 0;
   void dbg_set_snd_sync(bool on) { snd_sync = on; }
+  int dbg_snd_core1 = 0;   // 0 = off, 1 = snd_render_ahead renders everything it may, N >= 2 = at most N samples per frame
   unsigned long dbg_steps[3] = {0, 0, 0}, dbg_halt_steps[3] = {0, 0, 0};
   unsigned long dbg_pc_hist[3][65536];
   unsigned long dbg_loop_hist[4096];

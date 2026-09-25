@@ -8,8 +8,13 @@ static_assert(BOBLBOBL_OBJECTRAM == BOBLBOBL_VIDEORAM + 0x1d00, "videoram/object
 #include <stdlib.h>
 #include <stdio.h>
 
-#if BOBLBOBL_PROFILE && !BOBLBOBL_DBG_HARNESS
+#if !BOBLBOBL_DBG_HARNESS
 #include <xtensa/core-macros.h>
+#define BB_CYCLES() ((uint32_t)XTHAL_GET_CCOUNT())   // CPU cycles (240 per us)
+#else
+#define BB_CYCLES() 0u
+#endif
+#if BOBLBOBL_PROFILE && !BOBLBOBL_DBG_HARNESS
 #define BB_CCOUNT() ((uint32_t)XTHAL_GET_CCOUNT())
 #define BB_PROF 1
 #else
@@ -19,31 +24,104 @@ static_assert(BOBLBOBL_OBJECTRAM == BOBLBOBL_VIDEORAM + 0x1d00, "videoram/object
 // cycle totals; the render/audio ones are written on core 0, read on core 1
 static uint32_t bb_prof_main, bb_prof_sub, bb_prof_audio, bb_prof_frame, bb_prof_frames;
 static volatile uint32_t bb_prof_scan, bb_prof_blit, bb_prof_snd, bb_prof_snd_samples, bb_prof_screens, bb_prof_spans;
+static uint32_t bb_prof_snd1, bb_prof_snd1_samples;   // sound rendered on core 1 (snd_render_ahead)
+static volatile uint32_t bb_prof_snd_under;            // core 0 had nothing emulated to play (last sample repeated)
 
 static void bb_build_tile_empty(void);
+
+// boblbobl_z80.c: the shared Z80 core built with per-CPU 2KB page tables
+// (a page = direct pointer to the bytes main_rd/sub_rd/audio_rd - or the
+// _wr handlers - would use, 0 = call the machine). See that file.
+extern "C" {
+extern const unsigned char *bbz_rd_page[3][32];
+extern unsigned char *bbz_wr_page[3][32];
+extern const unsigned char *const *bbz_rd_cur;
+extern unsigned char *const *bbz_wr_cur;
+void bbz_Step(Z80 *R);
+void bbz_Int(Z80 *R, unsigned short Vector);
+void bbz_Reset(Z80 *R);
+}
+
+// The fixed ROM bytes (0000-7fff) of CPU c, through its page table
+#define BB_ROM(c, a) (bbz_rd_page[c][(a) >> 11][(a) & 0x7ff])
 
 boblbobl::~boblbobl()
 {
   for (int i = 0; i < 3; i++)
-    free(rom_ram[i]);
+    for (int k = 0; k < 4; k++)
+      free(rom_ram[i][k]);
 }
 
+// The three fixed 32KB ROMs to internal RAM in 8KB pieces (the heap is
+// fragmented - a 32KB block often does not exist), each piece falling back
+// to flash on its own. The page tables point at the copies.
 void boblbobl::roms_to_ram(void)
 {
   // most-executed first: sound CPU, main CPU, sub CPU
   static const unsigned char *const src[3] = { boblbobl_audiocpu, boblbobl_maincpu, boblbobl_subcpu };
-  const unsigned char **dst[3] = { &rom_audio, &rom_main, &rom_sub };
+  static const unsigned char cpu_of[3] = { 2, 0, 1 };
+  int in_ram[3] = { 0, 0, 0 };
   for (int i = 0; i < 3; i++)
-  {
-    if (!rom_ram[i])
+    for (int k = 0; k < 4; k++)
     {
-      rom_ram[i] = (unsigned char *)malloc(0x8000);
-      if (rom_ram[i])
-        memcpy(rom_ram[i], src[i], 0x8000);
+      if (!rom_ram[i][k])
+      {
+        rom_ram[i][k] = (unsigned char *)malloc(0x2000);
+        if (rom_ram[i][k])
+          memcpy(rom_ram[i][k], src[i] + k * 0x2000, 0x2000);
+      }
+      const unsigned char *base = rom_ram[i][k] ? rom_ram[i][k] : src[i] + k * 0x2000;
+      in_ram[i] += rom_ram[i][k] != 0;
+      for (int p = 0; p < 4; p++)
+        bbz_rd_page[cpu_of[i]][k * 4 + p] = base + p * 0x800;
     }
-    *dst[i] = rom_ram[i] ? rom_ram[i] : src[i];
+  printf("boblbobl: ROMs in RAM (8KB pieces of 4): audio=%d main=%d sub=%d\n", in_ram[0], in_ram[1], in_ram[2]);
+}
+
+// Page tables of everything else (see boblbobl_z80.c). Reads and writes
+// that have side effects or are I/O stay on the handlers (page 0):
+//  main: 8000-bfff = the current ROM bank (bankswitch_w), c000-dfff video /
+//        object RAM (writes only once game_started is set - main_wr sets it
+//        on the first non-zero video RAM write), e000-f7ff shared RAM;
+//        f800-ffff palette (recalc on write) / latches / I/O: handlers
+//  sub:  e000-f7ff shared RAM, the rest handlers
+//  audio: 8000-8fff RAM, the rest handlers (YM chips, latches)
+void boblbobl::build_pages(void)
+{
+  for (int c = 0; c < 3; c++)
+    for (int p = 16; p < 32; p++)
+      bbz_rd_page[c][p] = 0;
+  memset(bbz_wr_page, 0, sizeof(bbz_wr_page));
+  set_bank_pages();
+  for (int p = 0; p < 4; p++)
+    bbz_rd_page[0][24 + p] = &memory[BOBLBOBL_VIDEORAM + p * 0x800];
+  if (game_started)
+    for (int p = 0; p < 4; p++)
+      bbz_wr_page[0][24 + p] = &memory[BOBLBOBL_VIDEORAM + p * 0x800];
+  for (int p = 0; p < 3; p++)
+  {
+    bbz_rd_page[0][28 + p] = bbz_rd_page[1][28 + p] = &memory[BOBLBOBL_SHARERAM + p * 0x800];
+    bbz_wr_page[0][28 + p] = bbz_wr_page[1][28 + p] = &memory[BOBLBOBL_SHARERAM + p * 0x800];
   }
-  printf("boblbobl: ROMs in RAM: audio=%d main=%d sub=%d\n", rom_ram[0] != 0, rom_ram[1] != 0, rom_ram[2] != 0);
+  for (int p = 0; p < 2; p++)
+  {
+    bbz_rd_page[2][16 + p] = &memory[BOBLBOBL_AUDIO_RAM + p * 0x800];
+    bbz_wr_page[2][16 + p] = &memory[BOBLBOBL_AUDIO_RAM + p * 0x800];
+  }
+}
+
+void IRAM_ATTR boblbobl::set_bank_pages(void)
+{
+  for (int p = 0; p < 8; p++)
+    bbz_rd_page[0][16 + p] = m_bankptr + p * 0x800;
+}
+
+// current_cpu and the private core's page tables together
+void IRAM_ATTR boblbobl::set_cpu(int c)
+{
+  current_cpu = (char)c;
+  bbz_rd_cur = bbz_rd_page[c];
+  bbz_wr_cur = bbz_wr_page[c];
 }
 
 void boblbobl::reset()
@@ -56,6 +134,7 @@ void boblbobl::reset()
 
   m_bank = 0;
   m_bankptr = boblbobl_maincpu + 0x10000;
+  build_pages();
   m_flip = false;
   m_video_enable = false;
   sub_held_reset = true;
@@ -82,6 +161,10 @@ void boblbobl::reset()
   snd_ssg.construct();
   snd_opl.construct();
   snd_head = snd_tail = 0;
+  snd_out_wr = snd_out_rd = 0;
+  snd_last = 0;
+  snd_lock.store(0);
+  pace_init = false;
   snd_emu_clk_pub = 0;
   snd_evt_clk = 0;
   snd_evt_started = false;
@@ -104,7 +187,7 @@ void boblbobl::reset()
   vram_front = 0;
   span_count = 0;
 
-  current_cpu = 0;
+  set_cpu(0);
 }
 
 void boblbobl::stop()
@@ -115,6 +198,7 @@ void IRAM_ATTR boblbobl::bankswitch_w(unsigned char data)
 {
   m_bank = (data ^ 4) & 7;
   m_bankptr = boblbobl_maincpu + 0x10000 + m_bank * 0x4000;
+  set_bank_pages();
 
   if (data & 0x10)
   {
@@ -123,7 +207,7 @@ void IRAM_ATTR boblbobl::bankswitch_w(unsigned char data)
   else
   {
     sub_held_reset = true;
-    ResetZ80(&cpu[1]);
+    bbz_Reset(&cpu[1]);
   }
 
   m_video_enable = (data & 0x40) != 0;
@@ -253,9 +337,9 @@ void IRAM_ATTR boblbobl::update_sound_nmi(void)
   if (line && !sound_nmi_line && !audio_held_reset)
   {
     int saved_cpu = current_cpu;
-    current_cpu = 2;
-    IntZ80(&cpu[2], INT_NMI);
-    current_cpu = saved_cpu;
+    set_cpu(2);
+    bbz_Int(&cpu[2], INT_NMI);
+    set_cpu(saved_cpu);
   }
   sound_nmi_line = line;
 }
@@ -272,7 +356,7 @@ void boblbobl::sound_sreset(bool assert_line)
   if (assert_line)
   {
     audio_held_reset = true;          // audiocpu INPUT_LINE_RESET asserted
-    ResetZ80(&cpu[2]);
+    bbz_Reset(&cpu[2]);
   }
   else
   {
@@ -597,7 +681,7 @@ void IRAM_ATTR boblbobl::snd_step_clocks(uint32_t clocks, int32_t &fm_sum, int32
 unsigned char IRAM_ATTR boblbobl::main_rd(unsigned short addr)
 {
   if (addr < 0x8000)
-    return rom_main[addr];
+    return BB_ROM(0, addr);
   if (addr < 0xc000)
     return m_bankptr[addr - 0x8000];
   if (addr < 0xdd00)
@@ -685,7 +769,12 @@ void IRAM_ATTR boblbobl::main_wr(unsigned short addr, unsigned char val)
   {
     memory[BOBLBOBL_VIDEORAM + (addr - 0xc000)] = val;
     if (!game_started && val != 0)
+    {
       game_started = 1;
+      // from now on c000-dfff writes have no side effect: direct pages
+      for (int p = 0; p < 4; p++)
+        bbz_wr_page[0][24 + p] = &memory[BOBLBOBL_VIDEORAM + p * 0x800];
+    }
     return;
   }
   if (addr < 0xe000)
@@ -734,9 +823,9 @@ void IRAM_ATTR boblbobl::main_wr(unsigned short addr, unsigned char val)
     if (sub_held_reset)
       return;
     int saved_cpu = current_cpu;
-    current_cpu = 1;
-    IntZ80(&cpu[1], INT_NMI);
-    current_cpu = saved_cpu;
+    set_cpu(1);
+    bbz_Int(&cpu[1], INT_NMI);
+    set_cpu(saved_cpu);
     return;
   }
   if ((addr & 0xffc0) == 0xfb40)
@@ -771,7 +860,7 @@ void IRAM_ATTR boblbobl::main_wr(unsigned short addr, unsigned char val)
 unsigned char IRAM_ATTR boblbobl::sub_rd(unsigned short addr)
 {
   if (addr < 0x8000)
-    return rom_sub[addr];
+    return BB_ROM(1, addr);
   if (addr >= 0xe000 && addr < 0xf800)
     return memory[BOBLBOBL_SHARERAM + (addr - 0xe000)];
   return 0x00;     // unmapped (MAME reads 0x00)
@@ -789,7 +878,7 @@ void IRAM_ATTR boblbobl::sub_wr(unsigned short addr, unsigned char val)
 unsigned char IRAM_ATTR boblbobl::audio_rd(unsigned short addr)
 {
   if (addr < 0x8000)
-    return rom_audio[addr];
+    return BB_ROM(2, addr);
   if (addr >= 0x8000 && addr < 0x9000)
     return memory[BOBLBOBL_AUDIO_RAM + (addr - 0x8000)];
   if ((addr & 0xf001) == 0x9000)
@@ -877,11 +966,11 @@ unsigned char IRAM_ATTR boblbobl::opZ80(unsigned short Addr)
   switch (current_cpu)
   {
   case 0:
-    return (Addr < 0x8000) ? rom_main[Addr] : main_rd(Addr);
+    return (Addr < 0x8000) ? BB_ROM(0, Addr) : main_rd(Addr);
   case 1:
-    return (Addr < 0x8000) ? rom_sub[Addr] : sub_rd(Addr);
+    return (Addr < 0x8000) ? BB_ROM(1, Addr) : sub_rd(Addr);
   default:
-    return (Addr < 0x8000) ? rom_audio[Addr] : audio_rd(Addr);
+    return (Addr < 0x8000) ? BB_ROM(2, Addr) : audio_rd(Addr);
   }
 }
 
@@ -951,24 +1040,25 @@ static inline IRAM_ATTR bool bb_irq_ok(bool iff_before, const Z80 &c)
 // effect except burning cycles, so when no interrupt can be taken the rest of
 // the slice is consumed in whole loop iterations at once: same cycle count,
 // same ICount (the core derives R from it), same state.
-static inline IRAM_ATTR int bb_idle_loop_cycles(const unsigned char *rom, unsigned short pc)
+static inline IRAM_ATTR int bb_idle_loop_cycles(int cpu_n, unsigned short pc)
 {
   if (pc >= 0x7ffd)
     return 0;
-  if (rom[pc] == 0x18 && rom[pc + 1] == 0xfe)                         // jr $
+  unsigned char b0 = BB_ROM(cpu_n, pc), b1 = BB_ROM(cpu_n, pc + 1);
+  if (b0 == 0x18 && b1 == 0xfe)                                       // jr $
     return 12;
-  if (rom[pc] == 0xc3 && (rom[pc + 1] | (rom[pc + 2] << 8)) == pc)   // jp $
+  if (b0 == 0xc3 && (b1 | (BB_ROM(cpu_n, pc + 2) << 8)) == pc)        // jp $
     return 10;
   return 0;
 }
 
-static inline IRAM_ATTR bool bb_skip_idle(Z80 &c, const unsigned char *rom, bool irq_pending, long &budget)
+static inline IRAM_ATTR bool bb_skip_idle(Z80 &c, int cpu_n, bool irq_pending, long &budget)
 {
   if (c.IFF & IFF_EI)
     return false;
   if (irq_pending && (c.IFF & IFF_1))
     return false;
-  int cyc = bb_idle_loop_cycles(rom, c.PC.W);
+  int cyc = bb_idle_loop_cycles(cpu_n, c.PC.W);
   if (!cyc)
     return false;
   long n = (budget + cyc - 1) / cyc;
@@ -1024,6 +1114,30 @@ void IRAM_ATTR boblbobl::run_frame(void)
   const long frame_cycles = (long)BOBLBOBL_MAIN_CYCLES_PER_FRAME;   // 101376 at 6MHz
   const long frame_audio_cycles = frame_cycles / 2;                  // 50688 at 3MHz
 
+#if BOBLBOBL_REAL_SPEED && !BOBLBOBL_DBG_HARNESS
+  // BOBLBOBL_REAL_SPEED: emulate a frame only when real time has caught up
+  // with the game's own 59.19Hz (16896 us). Then the emulation makes exactly
+  // the 24000 samples a second the audio core plays. The credit is capped so
+  // a stall (menu, flash) does not make the game race afterwards.
+  {
+    uint32_t now = micros();
+    if (!pace_init)
+    {
+      pace_init = true;
+      pace_last = now;
+      pace_credit = 16896;
+    }
+    pace_credit += (int32_t)(now - pace_last);
+    pace_last = now;
+    if (pace_credit > 3 * 16896)
+      pace_credit = 3 * 16896;
+    if (pace_credit < 16896)
+      return;                                  // the display shows the last frame again
+    pace_credit -= 16896;
+  }
+#endif
+  const uint32_t frame_t0 = BB_CYCLES();
+
   for (int i = 0; i < BOBLBOBL_SLICES; i++)
   {
     // exact per-frame totals, spread over the slices without truncation loss
@@ -1041,15 +1155,15 @@ void IRAM_ATTR boblbobl::run_frame(void)
 
     // ---- main CPU
     uint32_t pc0 = BB_CCOUNT();
-    current_cpu = 0;
+    set_cpu(0);
     long main_budget = cycles_per_slice + main_cycle_debt;
     while (main_budget > 0)
     {
-      if (bb_skip_idle(cpu[0], rom_main, main_irq_pending, main_budget))
+      if (bb_skip_idle(cpu[0], 0, main_irq_pending, main_budget))
         break;
       bool iff = (cpu[0].IFF & IFF_1) != 0;
       int icount_before = cpu[0].ICount;
-      StepZ80(&cpu[0]);
+      bbz_Step(&cpu[0]);
 #if BOBLBOBL_DBG_HARNESS
       dbg_steps[0]++;
       if (cpu[0].IFF & IFF_HALT) dbg_halt_steps[0]++;
@@ -1062,7 +1176,7 @@ void IRAM_ATTR boblbobl::run_frame(void)
       if (main_irq_pending && bb_irq_ok(iff, cpu[0]))
       {
         main_irq_pending = false;
-        IntZ80(&cpu[0], INT_IRQ);
+        bbz_Int(&cpu[0], INT_IRQ);
         main_budget -= 13;
       }
 #if BOBLBOBL_DBG_HARNESS
@@ -1077,15 +1191,15 @@ void IRAM_ATTR boblbobl::run_frame(void)
     // ---- sub CPU
     if (!sub_held_reset)
     {
-      current_cpu = 1;
+      set_cpu(1);
       long sub_budget = cycles_per_slice + sub_cycle_debt;
       while (sub_budget > 0)
       {
-        if (bb_skip_idle(cpu[1], rom_sub, sub_irq_pending, sub_budget))
+        if (bb_skip_idle(cpu[1], 1, sub_irq_pending, sub_budget))
           break;
         bool iff = (cpu[1].IFF & IFF_1) != 0;
         int icount_before = cpu[1].ICount;
-        StepZ80(&cpu[1]);
+        bbz_Step(&cpu[1]);
 #if BOBLBOBL_DBG_HARNESS
         dbg_steps[1]++;
         if (cpu[1].IFF & IFF_HALT) dbg_halt_steps[1]++;
@@ -1098,7 +1212,7 @@ void IRAM_ATTR boblbobl::run_frame(void)
         if (sub_irq_pending && bb_irq_ok(iff, cpu[1]))
         {
           sub_irq_pending = false;
-          IntZ80(&cpu[1], INT_IRQ);
+          bbz_Int(&cpu[1], INT_IRQ);
           sub_budget -= 13;
         }
       }
@@ -1116,7 +1230,7 @@ void IRAM_ATTR boblbobl::run_frame(void)
     long audio_budget = audio_cycles_per_slice + audio_cycle_debt;
     if (!audio_held_reset)
     {
-      current_cpu = 2;
+      set_cpu(2);
       while (audio_budget > 0)
       {
         if (cpu[2].PC.W == BB_AUDIO_IDLE_PC)
@@ -1140,7 +1254,7 @@ void IRAM_ATTR boblbobl::run_frame(void)
         }
         bool iff = (cpu[2].IFF & IFF_1) != 0;
         int icount_before = cpu[2].ICount;
-        StepZ80(&cpu[2]);
+        bbz_Step(&cpu[2]);
 #if BOBLBOBL_DBG_HARNESS
         dbg_steps[2]++;
         if (cpu[2].IFF & IFF_HALT) dbg_halt_steps[2]++;
@@ -1151,7 +1265,7 @@ void IRAM_ATTR boblbobl::run_frame(void)
           consumed = 1;
         if (bb_irq_ok(iff, cpu[2]) && sound_irq_line())
         {
-          IntZ80(&cpu[2], INT_IRQ);
+          bbz_Int(&cpu[2], INT_IRQ);
           consumed += 13;
         }
         audio_budget -= consumed;
@@ -1176,8 +1290,9 @@ void IRAM_ATTR boblbobl::run_frame(void)
     bb_prof_audio += BB_CCOUNT() - pc2;
   }
 
-  current_cpu = 0;
+  set_cpu(0);
   snd_emu_clk_pub = ym_chip_clocks;
+  snd_render_ahead(frame_t0);
 
 #if BB_PROF
   {
@@ -1190,13 +1305,18 @@ void IRAM_ATTR boblbobl::run_frame(void)
     {
       // 240 cycles per us
       uint32_t f = bb_prof_frames, sc = bb_prof_screens ? bb_prof_screens : 1, ss = bb_prof_snd_samples ? bb_prof_snd_samples : 1;
-      printf("bb us/frame: main=%lu sub=%lu audiocpu=%lu (frame period %lu) | us/screen: scan=%lu blit=%lu spans=%lu screens=%lu | snd: %lu ns/sample, %lu samples\n",
+      uint32_t ss1 = bb_prof_snd1_samples ? bb_prof_snd1_samples : 1;
+      printf("bb us/frame: main=%lu sub=%lu audiocpu=%lu snd(core1)=%lu (frame period %lu) | us/screen: scan=%lu blit=%lu spans=%lu screens=%lu | snd core0: %lu ns/sample, %lu samples | core1: %lu ns/sample, %lu samples | repeated %lu\n",
              (unsigned long)(bb_prof_main / 240 / f), (unsigned long)(bb_prof_sub / 240 / f), (unsigned long)(bb_prof_audio / 240 / f),
-             (unsigned long)(bb_prof_frame / 240 / f),
+             (unsigned long)(bb_prof_snd1 / 240 / f), (unsigned long)(bb_prof_frame / 240 / f),
              (unsigned long)(bb_prof_scan / 240 / sc), (unsigned long)(bb_prof_blit / 240 / sc), (unsigned long)(bb_prof_spans / sc), (unsigned long)bb_prof_screens,
-             (unsigned long)((uint64_t)bb_prof_snd * 1000 / 240 / ss), (unsigned long)bb_prof_snd_samples);
+             (unsigned long)((uint64_t)bb_prof_snd * 1000 / 240 / ss), (unsigned long)bb_prof_snd_samples,
+             (unsigned long)((uint64_t)bb_prof_snd1 * 1000 / 240 / ss1), (unsigned long)bb_prof_snd1_samples,
+             (unsigned long)bb_prof_snd_under);
       bb_prof_main = bb_prof_sub = bb_prof_audio = bb_prof_frame = bb_prof_frames = 0;
       bb_prof_scan = bb_prof_blit = bb_prof_snd = bb_prof_snd_samples = bb_prof_screens = bb_prof_spans = 0;
+      bb_prof_snd1 = bb_prof_snd1_samples = 0;
+      bb_prof_snd_under = 0;
     }
   }
 #endif
@@ -1574,11 +1694,144 @@ static_assert(BOBLBOBL_SND_CLOCK % BOBLBOBL_SND_RATE == 0, "chip clock must divi
 #define BOBLBOBL_SND_GAIN 256    // 256 = MAME's own mix level
 #endif
 
+// Sound render sharing between the cores. The chip state and the event
+// clock below may be advanced by either core, one sample at a time, under
+// snd_lock:
+//  - core 1 (emulation), at the end of run_frame: snd_render_ahead() renders
+//    the samples that lie wholly inside emulated time into snd_out, while it
+//    has time left in the frame (BOBLBOBL_SND_CORE1_US);
+//  - core 0 (audio): renderFmSample() pops snd_out, and renders the next
+//    sample itself only when snd_out is empty.
+// Every sample is computed by the same code from the same state in the same
+// order, so the output does not depend on which core made it.
+// Core 1 has priority: while it renders (snd_core1_busy) core 0 does not
+// compete for the next samples. Otherwise a starving core 0 (emulation
+// behind real time) takes every sample as soon as a frame publishes it,
+// core 1 idles, core 0 stays full, the frame ticks stay slow - a stable
+// ~43Hz in bubble scenes (pass 7c capture).
+// When the event clock has caught up with emulated time (the emulation is
+// slower than real time) there is nothing emulated to play: the last sample
+// is repeated. (The old renderer kept stepping the chips at full cost there
+// - on the audio core, which then slowed the video, the frame ticks and so
+// the emulation further: gameplay locked at 26Hz.)
 int IRAM_ATTR boblbobl::renderFmSample()
 {
+  for (;;)
+  {
+    uint16_t r = snd_out_rd;
+    if (r != snd_out_wr)
+    {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      int v = snd_out[r];
+      snd_out_rd = (uint16_t)((r + 1) & (SND_OUT - 1));
+      snd_last = (short)v;
+      return v;
+    }
+    if (snd_core1_busy)
+    {
+      // core 1 is rendering its batch (it has priority - see above): repeat
+      // the last sample rather than take the samples it is about to render
 #if BB_PROF
-  uint32_t st0 = BB_CCOUNT();
+      bb_prof_snd_under++;
 #endif
+      return snd_last;
+    }
+    if (!snd_lock.exchange(1, std::memory_order_acquire))
+    {
+      if (snd_out_rd != snd_out_wr)
+      {
+        snd_lock.store(0, std::memory_order_release);   // core 1 just pushed one
+        continue;
+      }
+      if (snd_evt_started && (int32_t)(snd_emu_clk_pub - (snd_evt_clk + BOBLBOBL_SND_CLOCKS_PER_SAMPLE)) < 0)
+      {
+        snd_lock.store(0, std::memory_order_release);
+#if BB_PROF
+        bb_prof_snd_under++;
+#endif
+        return snd_last;
+      }
+#if BB_PROF
+      uint32_t st0 = BB_CCOUNT();
+#endif
+      int v = snd_render_one();
+#if BB_PROF
+      bb_prof_snd += BB_CCOUNT() - st0;
+      bb_prof_snd_samples++;
+#endif
+      snd_lock.store(0, std::memory_order_release);
+      snd_last = (short)v;
+      return v;
+    }
+    // core 1 is rendering one sample into snd_out: it is there in a moment.
+    // Wait off the memory bus (the cycle counter is a register) so core 1's
+    // render is not slowed by this loop.
+#if !BOBLBOBL_DBG_HARNESS
+    uint32_t c0 = BB_CYCLES();
+    while ((uint32_t)(BB_CYCLES() - c0) < 480)
+      ;
+#endif
+  }
+}
+
+// Core 1, end of run_frame (t0 = CPU cycle count at the start of the frame).
+void IRAM_ATTR boblbobl::snd_render_ahead(uint32_t t0)
+{
+  if (snd_sync)
+    return;
+#if BOBLBOBL_DBG_HARNESS
+  if (!dbg_snd_core1)
+    return;
+#endif
+  const uint32_t span = BOBLBOBL_SND_CLOCKS_PER_SAMPLE;
+  unsigned checks = 0;
+  (void)checks;
+  snd_core1_busy = true;
+#if BOBLBOBL_DBG_HARNESS
+  int limit = dbg_snd_core1 >= 2 ? dbg_snd_core1 : 1 << 30;   // stands in for the time limit
+#endif
+  for (;;)
+  {
+#if BOBLBOBL_DBG_HARNESS
+    if (limit-- <= 0)
+      break;
+#endif
+    uint16_t w = snd_out_wr;
+    if ((uint16_t)((w + 1) & (SND_OUT - 1)) == snd_out_rd)
+      break;                                            // snd_out full
+    if (snd_evt_started && (int32_t)(snd_emu_clk_pub - (snd_evt_clk + span)) < 0)
+      break;                                            // caught up with emulated time
+#if !BOBLBOBL_DBG_HARNESS
+    // Stop when the next frame tick is already waiting (the emulation task's
+    // notification count, read without taking it) - core 1 then has no time
+    // left and core 0 renders the rest - or at the BOBLBOBL_SND_CORE1_US cap.
+    if (((++checks) & 7) == 1 && ulTaskNotifyValueClear(NULL, 0) != 0)
+      break;
+    if ((uint32_t)(BB_CYCLES() - t0) > (uint32_t)BOBLBOBL_SND_CORE1_US * 240)
+      break;
+#endif
+    while (snd_lock.exchange(1, std::memory_order_acquire))
+      ;                                                 // core 0 is rendering one sample
+#if BB_PROF
+    uint32_t st0 = BB_CCOUNT();
+#endif
+    int v = snd_render_one();
+#if BB_PROF
+    bb_prof_snd1 += BB_CCOUNT() - st0;
+    bb_prof_snd1_samples++;
+#endif
+    snd_out[w] = (short)v;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    snd_out_wr = (uint16_t)((w + 1) & (SND_OUT - 1));
+    snd_lock.store(0, std::memory_order_release);
+  }
+  snd_core1_busy = false;
+  (void)t0;
+}
+
+// One output sample (the caller holds snd_lock).
+int IRAM_ATTR boblbobl::snd_render_one()
+{
   // snd_evt_clk is the emulation chip-clock time of the start of this output
   // sample. It is placed two frames behind the emulation once, then advances
   // at exactly the chip rate. It only holds when it catches up with the last
@@ -1652,10 +1905,6 @@ int IRAM_ATTR boblbobl::renderFmSample()
     v = 511;
   if (v < -511)
     v = -511;
-#if BB_PROF
-  bb_prof_snd += BB_CCOUNT() - st0;
-  bb_prof_snd_samples++;
-#endif
   return v;
 }
 

@@ -14,6 +14,17 @@ namespace bbfm
 
 // ---- ymfm.h helpers ------------------------------------------------------
 
+#ifdef BB_FM_HOST_PROF
+// host harness only: TSC time per stage of step_fast (see sndbench)
+#include <intrin.h>
+unsigned long long bbfm_prof[8];
+#define BBFM_T0() unsigned long long bbfm_t = __rdtsc()
+#define BBFM_T(k) do { unsigned long long bbfm_n = __rdtsc(); bbfm_prof[k] += bbfm_n - bbfm_t; bbfm_t = bbfm_n; } while (0)
+#else
+#define BBFM_T0() do { } while (0)
+#define BBFM_T(k) do { } while (0)
+#endif
+
 static inline IRAM_ATTR uint32_t bitfield(uint32_t value, int start, int length = 1)
 {
   return (value >> start) & ((1u << length) - 1);
@@ -634,8 +645,10 @@ void IRAM_ATTR opn_t::clock_fm(bool out)
 // the output are taken once per call instead of per chip sample.
 void IRAM_ATTR opn_t::step_fast(uint32_t n)
 {
+  BBFM_T0();
   total_clocks += (uint8_t)n;
   prepare_if_modified(n);
+  BBFM_T(0);
 
   for (uint32_t t = 0; t < n; t++)
   {
@@ -665,6 +678,7 @@ void IRAM_ATTR opn_t::step_fast(uint32_t n)
       }
     }
   }
+  BBFM_T(1);
 
   for (uint32_t c = 0; c < 3; c++)
   {
@@ -679,6 +693,7 @@ void IRAM_ATTR opn_t::step_fast(uint32_t n)
     if (bitfield(active_channels, c))
       sum += opn_output_4op(*this, c);
   last_out = roundtrip_fp(sum);
+  BBFM_T(2);
 }
 
 // ============================================================================
@@ -1020,8 +1035,10 @@ void IRAM_ATTR opl_t::generate(bool out)
 // per-sample step, the rest add n * phase_step.
 void IRAM_ATTR opl_t::step_fast(uint32_t n)
 {
+  BBFM_T0();
   total_clocks += (uint8_t)n;
   prepare_if_modified(n);
+  BBFM_T(3);
 
   for (uint32_t t = 0; t < n; t++)
   {
@@ -1039,6 +1056,7 @@ void IRAM_ATTR opl_t::step_fast(uint32_t n)
       op_clock_envelope<false>(p, env_counter >> 2, 0);
     }
   }
+  BBFM_T(4);
 
   for (uint32_t c = 0; c < 9; c++)
   {
@@ -1069,6 +1087,7 @@ void IRAM_ATTR opl_t::step_fast(uint32_t n)
         sum += opl_output_2op(*this, c);
   }
   last_out = roundtrip_fp(sum);
+  BBFM_T(5);
 }
 
 // ============================================================================
