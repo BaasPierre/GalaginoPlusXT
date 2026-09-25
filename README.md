@@ -26,6 +26,8 @@ Used [GalaginoPlus - VirtualClaudioBoy](https://github.com/VirtualClaudioBoy/Gal
 #### Bubble Bobble (boblbobl)
 It uses the parent rom from `bublbubl`. You need to merge the roms with `boblbobl` into a single `boblbobl.zip` file.
 
+#### Moonpatrol added (mpatrol) with cpu
+
 ---
 
 ### 📱 Portrait Builds
