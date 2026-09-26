@@ -5,7 +5,7 @@
 #include "cpus/i8048/i8048.h"
 #include "cpus/m6809/m6809.h"
 
- #define DEBUG_TIMING  // enable for debug
+// #define DEBUG_TIMING  // enable for debug
 
 #ifdef DEBUG_TIMING
 static int counter;
@@ -35,6 +35,11 @@ void emulation_start(void);
 void emulation_stop(void);
 void emulation_videoRendered(void);
 void emulation_notifyGive(void);
+#ifdef __cplusplus
+// true = the video loop has given a vblank the emulation has not run yet
+// (the emulation task has no time left in this frame)
+bool emulation_framePending(void);
+#endif
 void emulation_task(void *p);
 
 #ifdef __cplusplus

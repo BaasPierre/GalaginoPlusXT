@@ -1,10 +1,19 @@
 #include "Arduino.h"
 #include "emulation.h"
 #include "../machines/machineBase.h"
+#include <atomic>
 
 extern machineBase *currentMachine;
 TaskHandle_t emulationTaskHandle;
 volatile static char doDeleteEmulationTask;
+
+// vblanks given by the video loop but not yet emulated. A task notification
+// alone would merge several gives into one, losing frames while the video
+// loop catches up (main.cpp frame clock). Capped so a game that emulates
+// slower than real time slows down instead of building an ever growing
+// backlog.
+#define MAX_PENDING_FRAMES 2
+static std::atomic<int> pendingFrames(0);
 
 void emulation_start() {
 #ifdef DEBUG_TIMING
@@ -12,6 +21,7 @@ void emulation_start() {
 #endif
   currentMachine->reset();
   currentMachine->start();
+  pendingFrames = 0;
   xTaskCreatePinnedToCore(emulation_task, "emulation task", 4096, NULL, 2, &emulationTaskHandle, ARDUINO_RUNNING_CORE == 0 ? 1 : 0);
 }
 
@@ -37,7 +47,16 @@ void emulation_notifyGive() {
 #ifdef DEBUG_TIMING
   giveCount++;
 #endif
+  if (pendingFrames < MAX_PENDING_FRAMES)
+    pendingFrames++;
   xTaskNotifyGive(emulationTaskHandle);
+}
+
+// Use this, not the task's notification value: the value is only taken
+// when no frame is pending, so it can stay set while the emulation catches
+// up. IRAM: polled from machines' IRAM code on the emulation core.
+bool IRAM_ATTR emulation_framePending(void) {
+  return pendingFrames > 0;
 }
 
 void emulation_videoRendered(void) {
@@ -82,9 +101,14 @@ void emulation_task(void *p) {
     // Wait for signal from video task to emulate a 60Hz frame rate. Don't do
     // this unless the game has actually started to speed up the boot process
     // a little bit.
-    if(currentMachine->game_started)
-      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-    else
+    if(currentMachine->game_started) {
+      // one run_frame per vblank given (see pendingFrames); emulation_stop()
+      // wakes the task with a plain notify to delete it
+      while (pendingFrames <= 0 && !doDeleteEmulationTask)
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+      if (pendingFrames > 0)
+        pendingFrames--;
+    } else
       vTaskDelay(1); // give a millisecond delay to make the watchdog happy
 
 #ifdef DEBUG_TIMING
