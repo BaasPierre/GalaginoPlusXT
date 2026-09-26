@@ -52,8 +52,11 @@
 #define BOBLBOBL_SND_FAST 1
 #endif
 
+// 0 = off (default since the speed work is done, 2026-09-26). 1 = the once a
+// second "bb us/frame ..." line on the serial port; the device benchmark
+// (GalaginoPlusS3 envs bench_*) sets it to 1 itself.
 #ifndef BOBLBOBL_PROFILE
-#define BOBLBOBL_PROFILE 1
+#define BOBLBOBL_PROFILE 0
 #endif
 
 // Sound render on the emulation core (boblbobl.cpp renderFmSample): after
@@ -71,6 +74,15 @@
 // frame per display tick (1.4% fast; the audio timeline then has to skip).
 #ifndef BOBLBOBL_REAL_SPEED
 #define BOBLBOBL_REAL_SPEED 1
+#endif
+
+// When the emulation runs slower than real time the audio core runs out of
+// emulated sound. 1 = repeat the last sample (cheap, but the sound cuts out:
+// "repeated" in the profile line). 0 = keep stepping the chips, so notes
+// ring on - every such sample costs a full render on the audio core (this
+// locked gameplay at 26Hz with the old frame pacing, pass 7a).
+#ifndef BOBLBOBL_SND_REPEAT
+#define BOBLBOBL_SND_REPEAT 1
 #endif
 
 #ifndef BOBLBOBL_ROW_OFFSET
@@ -162,6 +174,10 @@ private:
   // ym_timers_advance(), so their output lines up with emulation time.
   bool snd_sync = false;
 
+public:
+  bool snd_repeat_when_behind = BOBLBOBL_SND_REPEAT;   // see BOBLBOBL_SND_REPEAT
+private:
+
   // Output samples rendered ahead on core 1 (renderFmSample, snd_render_ahead);
   // snd_lock guards the chip state and the event clock above.
   static const int SND_OUT = 2048;
@@ -236,11 +252,26 @@ private:
   void ym_timers_advance(int32_t clocks);
   bool sound_irq_line(void);
   bool opl_irq(void);
+
+  // Sound CPU slice (run_frame): the YM timers are advanced lazily. Clocks of
+  // executed instructions collect in ym_pending and are applied (ym_flush)
+  // only before something can see them: a sound CPU access to the chips or
+  // latches (audio_rd / audio_wr, 0x9000 up), a timer running out
+  // (ym_next_expiry), the idle-loop check, the end of the slice. Applying
+  // them later in one go gives the same state as after every instruction.
+  // ym_irq_cached = sound_irq_line(), kept current at the same points.
+  int32_t ym_pending = 0;
+  int32_t ym_next_expiry = 0x7fffffff;   // clocks until the first running timer expires
+  bool ym_irq_cached = false;
+  bool ym_touched = false;               // audio_rd / audio_wr reached the chips or latches
+  void ym_refresh(void);
+  void ym_flush(void);
   unsigned char opl_read_status(void);
   void ym_chips_reset(void);
 
   // irq0_line_hold on main/sub: raised at vblank, dropped on acknowledge.
   bool main_irq_pending = false;
+  long main_cycle_debt = 0, sub_cycle_debt = 0, audio_cycle_debt = 0;   // run_frame: cycles carried into the next slice
   bool sub_irq_pending = false;
   bool aud_prev_idle = false;          // sound CPU idle-loop skip (run_frame)
   uint32_t aud_prev_clk = 0;
@@ -327,6 +358,32 @@ public:
   long dbg_snd_drops = 0, dbg_snd_applied = 0;
   int32_t dbg_snd_max_late = 0;
   uint32_t dbg_chip_clocks() const { return ym_chip_clocks; }
+
+  // ESP32 timing simulation (harness "window" mode). Read-only views of the
+  // sound path, and core 1's render-ahead run in small batches so the
+  // simulation can interleave it with core 0 in time order.
+  unsigned long dbg_snd_rendered = 0;   // samples made by snd_render_one (either core)
+  int dbg_snd_out_count() const { return (snd_out_wr - snd_out_rd) & (SND_OUT - 1); }
+  // operators that are not silent: the FM render cost grows with these
+  int dbg_snd_live_ops() const
+  {
+    int n = 0;
+    for (int k = 0; k < 12; k++)
+      if (!(snd_opn.op[k].env_state == bbfm::EG_RELEASE && snd_opn.op[k].env_attenuation == 0x3ff)) n++;
+    for (int k = 0; k < 18; k++)
+      if (!(snd_opl.op[k].env_state == bbfm::EG_RELEASE && snd_opl.op[k].env_attenuation == 0x3ff)) n++;
+    return n;
+  }
+  void dbg_set_core1_busy(bool on) { snd_core1_busy = on; }
+  // snd_render_ahead limited to n (>= 2) samples; returns how many it made
+  int dbg_render_ahead(int n)
+  {
+    int save = dbg_snd_core1, before = dbg_snd_out_count();
+    dbg_snd_core1 = n < 2 ? 2 : n;
+    snd_render_ahead(0);
+    dbg_snd_core1 = save;
+    return dbg_snd_out_count() - before;
+  }
 
   // Load a MAME RAM dump of c000-f9ff (see debug/boblbobl_truth/bb_truth.lua)
   // so the renderer can be checked against a MAME snapshot of the same frame.

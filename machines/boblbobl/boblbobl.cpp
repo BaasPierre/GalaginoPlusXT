@@ -10,6 +10,7 @@ static_assert(BOBLBOBL_OBJECTRAM == BOBLBOBL_VIDEORAM + 0x1d00, "videoram/object
 
 #if !BOBLBOBL_DBG_HARNESS
 #include <xtensa/core-macros.h>
+bool emulation_framePending(void);   // emulation.cpp: a vblank waits (no time left)
 #define BB_CYCLES() ((uint32_t)XTHAL_GET_CCOUNT())   // CPU cycles (240 per us)
 #else
 #define BB_CYCLES() 0u
@@ -32,15 +33,7 @@ static void bb_build_tile_empty(void);
 // boblbobl_z80.c: the shared Z80 core built with per-CPU 2KB page tables
 // (a page = direct pointer to the bytes main_rd/sub_rd/audio_rd - or the
 // _wr handlers - would use, 0 = call the machine). See that file.
-extern "C" {
-extern const unsigned char *bbz_rd_page[3][32];
-extern unsigned char *bbz_wr_page[3][32];
-extern const unsigned char *const *bbz_rd_cur;
-extern unsigned char *const *bbz_wr_cur;
-void bbz_Step(Z80 *R);
-void bbz_Int(Z80 *R, unsigned short Vector);
-void bbz_Reset(Z80 *R);
-}
+#include "boblbobl_z80.h"
 
 // The fixed ROM bytes (0000-7fff) of CPU c, through its page table
 #define BB_ROM(c, a) (bbz_rd_page[c][(a) >> 11][(a) & 0x7ff])
@@ -151,6 +144,7 @@ void boblbobl::reset()
   sound_nmi_enable = false;
   sound_nmi_line = false;
   main_irq_pending = false;
+  main_cycle_debt = sub_cycle_debt = audio_cycle_debt = 0;
   aud_prev_idle = false;
   aud_prev_clk = 0;
   sub_irq_pending = false;
@@ -170,13 +164,18 @@ void boblbobl::reset()
   snd_evt_started = false;
   snd_ssg_cd = 0;
   snd_fm_cd = 0;
+  // before ym_chips_reset(): it queues a chip reset stamped with this clock.
+  // Stamped with the previous game's clock, it blocked every later register
+  // write in the ring (the game after a reset had no sound at all).
+  ym_chip_clocks = 0;   // ymfm m_total_clocks: counts from power-on, not reset by chip reset
+  ym_pending = 0;
+  ym_touched = false;
   ym_chips_reset();
 
   // MAME MACHINE_RESET(common): m_sreset_old starts CLEAR, so /SRESET is
   // pulsed (assert then clear). The sound CPU therefore runs from power-on;
   // it is NOT held until the main CPU writes 0xfa03.
   sreset_old = false;
-  ym_chip_clocks = 0;   // ymfm m_total_clocks: counts from power-on, not reset by chip reset
   sound_sreset(true);
   sound_sreset(false);
 
@@ -501,6 +500,33 @@ unsigned char IRAM_ATTR boblbobl::opl_read_status(void)
 bool IRAM_ATTR boblbobl::sound_irq_line(void)
 {
   return (opn_status & 0x03) != 0 || opl_irq();
+}
+
+// Lazy YM timers for the sound CPU slice (see boblbobl.h ym_pending).
+void IRAM_ATTR boblbobl::ym_refresh(void)
+{
+  int32_t next = 0x7fffffff;
+  for (int t = 0; t < 2; t++)
+  {
+    if (opn_timer[t].running && opn_timer[t].remain < next)
+      next = opn_timer[t].remain;
+    if (opl_timer[t].running && opl_timer[t].remain < next)
+      next = opl_timer[t].remain;
+  }
+  // snd_sync (harness) steps the chips inside ym_timers_advance: keep the
+  // per-instruction chunks by applying the clocks at the next instruction
+  ym_next_expiry = snd_sync ? 0 : next;
+  ym_irq_cached = sound_irq_line();
+}
+
+void IRAM_ATTR boblbobl::ym_flush(void)
+{
+  if (ym_pending)
+  {
+    ym_timers_advance(ym_pending);
+    ym_pending = 0;
+  }
+  ym_refresh();
 }
 
 void boblbobl::ym_chips_reset(void)
@@ -881,6 +907,13 @@ unsigned char IRAM_ATTR boblbobl::audio_rd(unsigned short addr)
     return BB_ROM(2, addr);
   if (addr >= 0x8000 && addr < 0x9000)
     return memory[BOBLBOBL_AUDIO_RAM + (addr - 0x8000)];
+  // chips / latches: bring the YM timers up to this instruction first
+  if (ym_pending)
+  {
+    ym_timers_advance(ym_pending);
+    ym_pending = 0;
+  }
+  ym_touched = true;
   if ((addr & 0xf001) == 0x9000)
     return opn_status & 0x03;                       // ym2203::read_status (never busy here)
   if ((addr & 0xf001) == 0x9001)
@@ -916,6 +949,17 @@ unsigned char IRAM_ATTR boblbobl::audio_rd(unsigned short addr)
 
 void IRAM_ATTR boblbobl::audio_wr(unsigned short addr, unsigned char val)
 {
+  // chips / latches: bring the YM timers up to this instruction first (the
+  // register write ring is timestamped with ym_chip_clocks)
+  if (addr >= 0x9000)
+  {
+    if (ym_pending)
+    {
+      ym_timers_advance(ym_pending);
+      ym_pending = 0;
+    }
+    ym_touched = true;
+  }
 #if BOBLBOBL_DBG_HARNESS
   if (dbg_snd_hook && addr >= 0x9000 && addr < 0xb000)
     dbg_snd_hook('A', addr, val);
@@ -1039,33 +1083,8 @@ static inline IRAM_ATTR bool bb_irq_ok(bool iff_before, const Z80 &c)
 // "jp $000A"; ~64% / ~89% of all executed instructions). Such a loop has no
 // effect except burning cycles, so when no interrupt can be taken the rest of
 // the slice is consumed in whole loop iterations at once: same cycle count,
-// same ICount (the core derives R from it), same state.
-static inline IRAM_ATTR int bb_idle_loop_cycles(int cpu_n, unsigned short pc)
-{
-  if (pc >= 0x7ffd)
-    return 0;
-  unsigned char b0 = BB_ROM(cpu_n, pc), b1 = BB_ROM(cpu_n, pc + 1);
-  if (b0 == 0x18 && b1 == 0xfe)                                       // jr $
-    return 12;
-  if (b0 == 0xc3 && (b1 | (BB_ROM(cpu_n, pc + 2) << 8)) == pc)        // jp $
-    return 10;
-  return 0;
-}
-
-static inline IRAM_ATTR bool bb_skip_idle(Z80 &c, int cpu_n, bool irq_pending, long &budget)
-{
-  if (c.IFF & IFF_EI)
-    return false;
-  if (irq_pending && (c.IFF & IFF_1))
-    return false;
-  int cyc = bb_idle_loop_cycles(cpu_n, c.PC.W);
-  if (!cyc)
-    return false;
-  long n = (budget + cyc - 1) / cyc;
-  budget -= n * cyc;
-  c.ICount -= (int)(n * cyc);
-  return true;
-}
+// same ICount (the core derives R from it), same state. This is done inside
+// the main/sub slice loop, bbz_RunSlice in boblbobl_z80.c.
 
 // Sound CPU idle loop (a78-07.46): 016D di / call 02A3 / ei / call 024D /
 // call 0268 / jr 016D. With the command queue empty (8F80 == 8F81), no reply
@@ -1108,9 +1127,6 @@ long IRAM_ATTR boblbobl::audio_idle_passes(long budget)
 
 void IRAM_ATTR boblbobl::run_frame(void)
 {
-  static long main_cycle_debt = 0;
-  static long sub_cycle_debt = 0;
-  static long audio_cycle_debt = 0;
   const long frame_cycles = (long)BOBLBOBL_MAIN_CYCLES_PER_FRAME;   // 101376 at 6MHz
   const long frame_audio_cycles = frame_cycles / 2;                  // 50688 at 3MHz
 
@@ -1153,38 +1169,15 @@ void IRAM_ATTR boblbobl::run_frame(void)
         sub_irq_pending = true;
     }
 
-    // ---- main CPU
+    // ---- main CPU (bbz_RunSlice: the whole slice in boblbobl_z80.c)
     uint32_t pc0 = BB_CCOUNT();
     set_cpu(0);
-    long main_budget = cycles_per_slice + main_cycle_debt;
-    while (main_budget > 0)
-    {
-      if (bb_skip_idle(cpu[0], 0, main_irq_pending, main_budget))
-        break;
-      bool iff = (cpu[0].IFF & IFF_1) != 0;
-      int icount_before = cpu[0].ICount;
-      bbz_Step(&cpu[0]);
 #if BOBLBOBL_DBG_HARNESS
-      dbg_steps[0]++;
-      if (cpu[0].IFF & IFF_HALT) dbg_halt_steps[0]++;
-      dbg_pc_hist[0][cpu[0].PC.W]++;
+    const bbz_dbg_t dbg_main = { &dbg_steps[0], &dbg_halt_steps[0], dbg_pc_hist[0], dbg_trace_hook };
+    main_cycle_debt = bbz_RunSlice(&cpu[0], 0, cycles_per_slice + main_cycle_debt, &main_irq_pending, &dbg_main);
+#else
+    main_cycle_debt = bbz_RunSlice(&cpu[0], 0, cycles_per_slice + main_cycle_debt, &main_irq_pending);
 #endif
-      long consumed = (long)(icount_before - cpu[0].ICount);
-      if (consumed <= 0)
-        consumed = 1;
-      main_budget -= consumed;
-      if (main_irq_pending && bb_irq_ok(iff, cpu[0]))
-      {
-        main_irq_pending = false;
-        bbz_Int(&cpu[0], INT_IRQ);
-        main_budget -= 13;
-      }
-#if BOBLBOBL_DBG_HARNESS
-      if (dbg_trace_hook)
-        dbg_trace_hook(cpu[0].PC.W);
-#endif
-    }
-    main_cycle_debt = main_budget;
     uint32_t pc1 = BB_CCOUNT();
     bb_prof_main += pc1 - pc0;
 
@@ -1192,31 +1185,12 @@ void IRAM_ATTR boblbobl::run_frame(void)
     if (!sub_held_reset)
     {
       set_cpu(1);
-      long sub_budget = cycles_per_slice + sub_cycle_debt;
-      while (sub_budget > 0)
-      {
-        if (bb_skip_idle(cpu[1], 1, sub_irq_pending, sub_budget))
-          break;
-        bool iff = (cpu[1].IFF & IFF_1) != 0;
-        int icount_before = cpu[1].ICount;
-        bbz_Step(&cpu[1]);
 #if BOBLBOBL_DBG_HARNESS
-        dbg_steps[1]++;
-        if (cpu[1].IFF & IFF_HALT) dbg_halt_steps[1]++;
-        dbg_pc_hist[1][cpu[1].PC.W]++;
+      const bbz_dbg_t dbg_sub = { &dbg_steps[1], &dbg_halt_steps[1], dbg_pc_hist[1], 0 };
+      sub_cycle_debt = bbz_RunSlice(&cpu[1], 1, cycles_per_slice + sub_cycle_debt, &sub_irq_pending, &dbg_sub);
+#else
+      sub_cycle_debt = bbz_RunSlice(&cpu[1], 1, cycles_per_slice + sub_cycle_debt, &sub_irq_pending);
 #endif
-        long consumed = (long)(icount_before - cpu[1].ICount);
-        if (consumed <= 0)
-          consumed = 1;
-        sub_budget -= consumed;
-        if (sub_irq_pending && bb_irq_ok(iff, cpu[1]))
-        {
-          sub_irq_pending = false;
-          bbz_Int(&cpu[1], INT_IRQ);
-          sub_budget -= 13;
-        }
-      }
-      sub_cycle_debt = sub_budget;
     }
     else
     {
@@ -1231,10 +1205,12 @@ void IRAM_ATTR boblbobl::run_frame(void)
     if (!audio_held_reset)
     {
       set_cpu(2);
+      ym_refresh();   // the main CPU may have reset the chips since the last slice
       while (audio_budget > 0)
       {
         if (cpu[2].PC.W == BB_AUDIO_IDLE_PC)
         {
+          ym_flush();   // the idle test reads the timers, status and clock
           bool idle = audio_idle_state();
           if (idle && aud_prev_idle && ym_chip_clocks - aud_prev_clk == BB_AUDIO_IDLE_CYCLES)
           {
@@ -1245,6 +1221,7 @@ void IRAM_ATTR boblbobl::run_frame(void)
               cpu[2].ICount -= (int)c;
               audio_budget -= c;
               ym_timers_advance((int32_t)c);
+              ym_refresh();
               aud_prev_clk = ym_chip_clocks;   // back at 016D, still idle
               continue;
             }
@@ -1263,16 +1240,27 @@ void IRAM_ATTR boblbobl::run_frame(void)
         long consumed = (long)(icount_before - cpu[2].ICount);
         if (consumed <= 0)
           consumed = 1;
-        if (bb_irq_ok(iff, cpu[2]) && sound_irq_line())
+        // The IRQ line as it was before this instruction's clocks: the chips
+        // may have changed it (audio_rd / audio_wr brought the timers up to
+        // date first), or a timer may have run out in the clocks collected.
+        if (ym_touched)
+        {
+          ym_touched = false;
+          ym_refresh();
+        }
+        if (ym_pending >= ym_next_expiry)
+          ym_flush();
+        if (bb_irq_ok(iff, cpu[2]) && ym_irq_cached)
         {
           bbz_Int(&cpu[2], INT_IRQ);
           consumed += 13;
         }
         audio_budget -= consumed;
-        ym_timers_advance((int32_t)consumed);
+        ym_pending += (int32_t)consumed;   // was ym_timers_advance(consumed)
 #if BOBLBOBL_DBG_HARNESS
         if (cpu[2].PC.W == 0x016D)
         {
+          ym_flush();
           static uint32_t lastclk = 0;
           uint32_t d = ym_chip_clocks - lastclk;
           if (d < 4096) dbg_loop_hist[d]++;
@@ -1280,6 +1268,7 @@ void IRAM_ATTR boblbobl::run_frame(void)
         }
 #endif
       }
+      ym_flush();     // nothing outside this loop sees ym_pending
       audio_cycle_debt = audio_budget;
     }
     else
@@ -1743,7 +1732,7 @@ int IRAM_ATTR boblbobl::renderFmSample()
         snd_lock.store(0, std::memory_order_release);   // core 1 just pushed one
         continue;
       }
-      if (snd_evt_started && (int32_t)(snd_emu_clk_pub - (snd_evt_clk + BOBLBOBL_SND_CLOCKS_PER_SAMPLE)) < 0)
+      if (snd_repeat_when_behind && snd_evt_started && (int32_t)(snd_emu_clk_pub - (snd_evt_clk + BOBLBOBL_SND_CLOCKS_PER_SAMPLE)) < 0)
       {
         snd_lock.store(0, std::memory_order_release);
 #if BB_PROF
@@ -1802,10 +1791,10 @@ void IRAM_ATTR boblbobl::snd_render_ahead(uint32_t t0)
     if (snd_evt_started && (int32_t)(snd_emu_clk_pub - (snd_evt_clk + span)) < 0)
       break;                                            // caught up with emulated time
 #if !BOBLBOBL_DBG_HARNESS
-    // Stop when the next frame tick is already waiting (the emulation task's
-    // notification count, read without taking it) - core 1 then has no time
-    // left and core 0 renders the rest - or at the BOBLBOBL_SND_CORE1_US cap.
-    if (((++checks) & 7) == 1 && ulTaskNotifyValueClear(NULL, 0) != 0)
+    // Stop when the next frame tick is already waiting (emulation.cpp's
+    // pending frame count) - core 1 then has no time left and core 0
+    // renders the rest - or at the BOBLBOBL_SND_CORE1_US cap.
+    if (((++checks) & 7) == 1 && emulation_framePending())
       break;
     if ((uint32_t)(BB_CYCLES() - t0) > (uint32_t)BOBLBOBL_SND_CORE1_US * 240)
       break;
@@ -1837,6 +1826,9 @@ int IRAM_ATTR boblbobl::snd_render_one()
   // at exactly the chip rate. It only holds when it catches up with the last
   // completed emulation frame (emulation slower than real time), and is
   // re-placed if it falls more than 4 frames behind (e.g. audio paused).
+#if BOBLBOBL_DBG_HARNESS
+  dbg_snd_rendered++;
+#endif
   uint32_t pub = snd_emu_clk_pub;
   int32_t behind = (int32_t)(pub - snd_evt_clk);
   if (!snd_evt_started || behind > (int32_t)(4 * BOBLBOBL_SND_LATENCY))
